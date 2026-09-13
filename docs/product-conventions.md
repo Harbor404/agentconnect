@@ -1279,6 +1279,8 @@ installed in image**, according to the selected view. Only a runtime with neithe
 an installation in that environment nor a stored login is hidden. Missing binaries
 take precedence over login warnings. Enumerating models does not prove that the
 runtime is signed in; expired credentials remain visible and may require login.
+Runtime pickers group choices displaying **Login required** at the end, preserving
+the order within each group. These choices remain selectable.
 
 On self-hosted daemons, the sandbox view initially folds away runtimes installed in
 the image but not on the host. A **Show runtimes in sandbox but not on host** control
