@@ -63,15 +63,41 @@ export function buildMcpAppCsp(csp?: McpAppCsp): string {
 }
 
 /**
- * The document actually loaded into the frame: the policy first, then the template verbatim.
+ * The document actually loaded into the frame: the template with our policy injected into its
+ * `<head>`.
  *
- * Prepended rather than injected into the template's own `<head>`, and that is load-bearing — a
- * parser-driven insertion would have to understand a document the host did not write, while a
- * meta element before anything else is applied to everything after it. The template's own markup
- * is never rewritten: a host that edits an app's HTML is a host that can break it invisibly.
+ * PARSED, NOT SCANNED, and that is the whole correctness of this function. Two earlier attempts
+ * here were silently wrong in opposite directions. Prepending the meta drops the doctype (quirks
+ * mode) and lands the policy outside `<head>`, where browsers do not honor `http-equiv` CSP at
+ * all. Inserting it at a `<head>` found by regex is worse: that match may be inside a comment, a
+ * quoted attribute, or RCDATA, and the policy is then commented out or inert text — so the frame
+ * runs with no declared-domain restriction whatever. Both failures are invisible, on exactly the
+ * templates §7.2 exists for.
+ *
+ * Masking those regions well enough to scan safely means writing an HTML tokenizer. There is no
+ * need to: this document is about to be parsed by the browser regardless, so parsing it here and
+ * inserting into the real `<head>` gives the same tree the frame would have built, with the policy
+ * provably in the one place it is honored. A fragment needs no special case either — the parser
+ * supplies the `<html>`/`<head>`/`<body>` it implies — and emitting the doctype unconditionally
+ * keeps every template in standards mode.
+ *
+ * The cost is honest and accepted: the markup is re-serialized rather than passed through byte for
+ * byte. What comes out is the parser's own normalization of what was going in, which is what the
+ * frame would have rendered either way.
  */
 export function buildMcpAppDocument(html: string, csp?: McpAppCsp): string {
-  return `<meta http-equiv="Content-Security-Policy" content="${buildMcpAppCsp(csp).replace(/"/g, '&quot;')}">\n${html}`
+  const meta = `<meta http-equiv="Content-Security-Policy" content="${buildMcpAppCsp(csp).replace(/"/g, '&quot;')}">`
+  // Server-side render has no DOM. `srcdoc` only means anything in a browser and the card arms a
+  // frame only against a live bridge, so this value is never the one a reader's frame loads; the
+  // wrap keeps the policy structurally inside a head regardless.
+  if (typeof DOMParser === 'undefined') {
+    return `<!doctype html><html><head>${meta}</head><body>${html}</body></html>`
+  }
+  const parsed = new DOMParser().parseFromString(html, 'text/html')
+  const head = parsed.head ?? parsed.createElement('head')
+  if (!parsed.head) parsed.documentElement.prepend(head)
+  head.insertAdjacentHTML('afterbegin', meta)
+  return `<!doctype html>${parsed.documentElement.outerHTML}`
 }
 
 /** Whether a `ui/open-link` destination may be opened for the reader. Only `http`/`https`, which
