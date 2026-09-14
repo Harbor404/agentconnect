@@ -15,6 +15,8 @@ import { ExternalMemoryEntries } from '../src/memory/entries/external.js'
 import { memoryContinuations, memoryEntryTokens } from '../src/memory/entries/state.js'
 import type { MemoryEntriesView } from '../src/memory/entries/contract.js'
 import type { MemoryRecord, RecordMemoryAdmin } from '../src/memory/types.js'
+import type { MemoryProvider, MemoryScope } from '../src/memory/provider.js'
+import { MemoryConflictError, type MemoryWriteSource } from '../src/memory/store.js'
 import type { LocalStore } from '../src/store/local-store.js'
 import { memoryStoreDatabase, openTestStore, usingPostgresStore } from './store-support.js'
 
@@ -31,13 +33,23 @@ async function store() {
   cleanup.push(() => db.close())
   return { db, dir, path }
 }
-async function service(db: LocalStore, resolve: () => Promise<MemoryEntriesView>, agent = 'a') {
-  return new MemoryEntries(resolve, await memoryEntryTokens(db), memoryContinuations(db, agent))
+async function service(db: LocalStore, resolve: () => Promise<MemoryEntriesView>, agent = 'a', write = false) {
+  return new MemoryEntries(
+    resolve,
+    await memoryEntryTokens(db),
+    memoryContinuations(db, agent),
+    Date.now,
+    write ? async () => {} : undefined
+  )
 }
-async function fixture(kind: 'managed' | 'external', count = 37) {
+const LIMITS = { maxItemBytes: 131072, maxPageItems: 7 }
+async function fixture(kind: 'managed' | 'external', count = 37, options: { write?: boolean } = {}) {
   const { db, dir, path } = await store()
   const records = new Map<string, MemoryRecord>()
   const requests: { cursor?: string; limit: number }[] = []
+  const mutations: Record<string, unknown>[] = []
+  const recordScope = { kind: 'agent' as const, key: 'ac:agent:a' }
+  let sequence = 0
   const root = new LocalMemoryFs(dir)
   const provider = new ManagedMemoryProvider(() => localMemoryHome(root))
   for (let i = 0; i < count; i++) {
@@ -46,9 +58,10 @@ async function fixture(kind: 'managed' | 'external', count = 37) {
     records.set(id, { id, text, scope: { kind: 'agent', key: 'ac:agent:a' } })
     if (kind === 'managed') await root.writeFile(`memory/${id}`, text)
   }
+  // A versioned in-memory backend: conditional when a version is supplied, last-write-wins otherwise.
   const admin: RecordMemoryAdmin = {
     shape: 'records',
-    capabilities: new Set(['list', 'get']),
+    capabilities: new Set(options.write ? ['list', 'get', 'create', 'update', 'delete'] : ['list', 'get']),
     async list(_scope, request) {
       requests.push(request)
       const rows = [...records.values()]
@@ -64,25 +77,51 @@ async function fixture(kind: 'managed' | 'external', count = 37) {
     async search() {
       throw new Error('unsupported')
     },
-    async create() {
-      throw new Error('unsupported')
+    async create(_scope, request) {
+      mutations.push(request)
+      const record: MemoryRecord = {
+        id: `record-${++sequence}`,
+        text: request.text,
+        scope: recordScope,
+        version: '1',
+        ...(request.metadata ? { metadata: request.metadata } : {})
+      }
+      records.set(record.id, record)
+      return record
     },
-    async update() {
-      throw new Error('unsupported')
+    async update(_scope, request) {
+      mutations.push(request)
+      const current = records.get(request.id)
+      if (!current) throw new Error('backend rejected the update')
+      if (request.version && request.version !== current.version) throw new MemoryConflictError('stale version')
+      const record: MemoryRecord = {
+        ...current,
+        text: request.text,
+        version: String(Number(current.version ?? 0) + 1),
+        ...(request.metadata ? { metadata: request.metadata } : {})
+      }
+      records.set(record.id, record)
+      return record
     },
-    async delete() {
-      throw new Error('unsupported')
+    async delete(_scope, request) {
+      mutations.push(request)
+      const current = records.get(request.id)
+      if (!current) return false
+      if (request.version && request.version !== current.version) throw new MemoryConflictError('stale version')
+      records.delete(request.id)
+      return true
     },
     async history() {
       throw new Error('unsupported')
     }
   }
   let binding = 'binding-1'
+  const writeContext = options.write ? { source: 'tool' as const } : undefined
   const resolve = async () =>
     kind === 'managed'
       ? provider.entryView({ agentId: binding })
-      : new ExternalMemoryEntries(admin, { agentId: 'a' }, binding, { maxItemBytes: 131072, maxPageItems: 7 })
-  const api = await service(db, resolve)
+      : new ExternalMemoryEntries(admin, { agentId: 'a' }, binding, LIMITS, writeContext)
+  const api = await service(db, resolve, 'a', options.write)
   return {
     path,
     api,
@@ -92,6 +131,7 @@ async function fixture(kind: 'managed' | 'external', count = 37) {
     records,
     admin,
     requests,
+    mutations,
     resolve,
     replaceBinding() {
       binding = 'binding-2'
@@ -448,4 +488,209 @@ it('pins synthetic MCP reads to the Dream draft even after the live provider cha
   expect(await executeTool(ctx, 'getMemoryEntry', { ref: page.entries[0]!.ref }, deps)).toMatchObject({
     text: 'only the staged proposal'
   })
+})
+
+describe('unified external mutations', () => {
+  it('projects declared record mutations with last-write-wins receipts, refusing what v1 cannot express', async () => {
+    const f = await fixture('external', 2, { write: true })
+    expect(await f.api.describe()).toMatchObject({
+      operations: ['list', 'get', 'create', 'update', 'delete'],
+      writeConsistency: 'last-write-wins',
+      exactCreate: false,
+      exactEdit: false
+    })
+    const created = await f.api.create({
+      text: 'Deploy on Fridays only after the smoke test',
+      metadata: { topic: 'ops' }
+    })
+    expect(created).toMatchObject({ state: 'completed', entry: { format: 'text', editable: true, revision: '1' } })
+    expect(f.mutations.at(-1)).toMatchObject({ operationId: created.operationId, metadata: { topic: 'ops' } })
+    const ref = created.entry!.ref
+    expect(await f.api.get({ ref })).toMatchObject({
+      text: 'Deploy on Fridays only after the smoke test',
+      metadata: { topic: 'ops' },
+      complete: true
+    })
+    await expect(f.api.create({ label: 'named', text: 'x' })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    await expect(f.api.create({ text: '' })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    await expect(f.api.create({ text: 'x'.repeat(LIMITS.maxItemBytes + 1) })).rejects.toMatchObject({
+      code: 'TOO_LARGE'
+    })
+    await expect(
+      f.api.update({ ref, revision: '1', edit: { oldText: 'Fridays', newText: 'Mondays' } })
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED' })
+    // Omitted metadata is forwarded as omitted, so the backend keeps what it holds.
+    const updated = await f.api.update({ ref, revision: '1', text: 'Deploy on Mondays' })
+    expect(updated.entry).toMatchObject({ revision: '2', label: 'Deploy on Mondays' })
+    expect(f.mutations.at(-1)).not.toHaveProperty('metadata')
+    expect(await f.api.get({ ref })).toMatchObject({ text: 'Deploy on Mondays', metadata: { topic: 'ops' } })
+    await expect(f.api.update({ ref, revision: '1', text: 'stale' })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      currentRevision: '2'
+    })
+    expect(await f.api.get({ ref })).toMatchObject({ text: 'Deploy on Mondays' })
+    // Without a revision the write is last-write-wins, exactly as advertised.
+    expect((await f.api.update({ ref, text: 'Deploy on Tuesdays' })).entry).toMatchObject({ revision: '3' })
+    await expect(f.api.delete({ ref, revision: '2' })).rejects.toMatchObject({ code: 'CONFLICT', currentRevision: '3' })
+    expect(await f.api.delete({ ref, revision: '3' })).toMatchObject({ state: 'completed', deletedRef: ref })
+    expect(await f.api.get({ ref })).toBeNull()
+    await expect(f.api.delete({ ref })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    // A backend rejection after egress cannot be told from a lost apply, so it is never replayed.
+    await expect(f.api.update({ ref, text: 'gone' })).rejects.toMatchObject({ code: 'AMBIGUOUS_WRITE' })
+    expect(f.records.size).toBe(2)
+  })
+
+  it('keeps record mutations behind the write gate and the declared capability set', async () => {
+    const readOnly = await fixture('external', 1)
+    await expect(readOnly.api.create({ text: 'x' })).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    expect((await readOnly.api.list({ limit: 1 })).entries[0]).toMatchObject({ editable: false })
+    const f = await fixture('external', 1, { write: true })
+    ;(f.admin.capabilities as Set<string>).delete('update')
+    expect((await f.api.describe()).operations).toEqual(['list', 'get', 'create', 'delete'])
+    const page = await f.api.list({ limit: 1 })
+    expect(page.entries[0]).toMatchObject({ editable: false })
+    await expect(f.api.update({ ref: page.entries[0]!.ref, text: 'x' })).rejects.toMatchObject({ code: 'UNSUPPORTED' })
+    expect(f.mutations).toHaveLength(0)
+  })
+
+  it('publishes external record mutations for console callers with bounded typed outcomes', async () => {
+    const f = await fixture('external', 1, { write: true })
+    const { createMemoryEntriesWriter } = await import('../src/cp/memory-entries.js')
+    const provider = {
+      entryView: async (scope: MemoryScope, writeSource?: MemoryWriteSource) =>
+        new ExternalMemoryEntries(
+          f.admin,
+          scope,
+          'binding-1',
+          LIMITS,
+          writeSource ? { source: writeSource } : undefined
+        )
+    } as unknown as MemoryProvider
+    const write = createMemoryEntriesWriter(provider, f.db, (id) => id === 'a')
+    const created = await write({ agentId: 'a', operation: 'create', request: { text: 'Console fact' } })
+    expect(created).toMatchObject({
+      operation: 'completed',
+      result: { state: 'completed', entry: { editable: true, format: 'text', revision: '1' } }
+    })
+    if (created.operation !== 'completed') throw new Error('expected completion')
+    const ref = created.result.entry!.ref
+    expect(
+      await write({ agentId: 'a', operation: 'update', request: { ref, revision: 'stale', text: 'x' } })
+    ).toMatchObject({ operation: 'error', code: 'CONFLICT', currentRevision: '1' })
+    expect(await write({ agentId: 'a', operation: 'delete', request: { ref, revision: '1' } })).toMatchObject({
+      operation: 'completed',
+      result: { deletedRef: ref }
+    })
+    expect(await write({ agentId: 'foreign', operation: 'create', request: { text: 'x' } })).toMatchObject({
+      operation: 'error',
+      code: 'FORBIDDEN'
+    })
+    expect(f.mutations).toHaveLength(3)
+  })
+})
+
+describe('unified search', () => {
+  it('managed lexical search matches every term over label, description and body, in a deterministic order', async () => {
+    const f = await fixture('managed', 0)
+    await f.root.writeFile(
+      'memory/deploy.md',
+      '---\nname: Deployment rules\ndescription: How releases reach production\n---\nDeploy on Fridays only after the smoke test passes.\n'
+    )
+    await f.root.writeFile(
+      'memory/oncall.md',
+      '---\nname: On-call\n---\nThe on-call engineer approves every Friday deploy.\n'
+    )
+    await f.root.writeFile('memory/lunch.md', 'Team lunch happens on Fridays.\n')
+    expect(await f.api.describe()).toMatchObject({ operations: ['list', 'get', 'search'], searchKind: 'lexical' })
+    const page = await f.api.search({ query: 'friday DEPLOY' })
+    expect(page).toMatchObject({ kind: 'lexical', coverage: 'complete' })
+    expect(page.hits.map((hit) => hit.entry.label)).toEqual(['Deployment rules', 'On-call'])
+    expect(page.hits[0]!.snippet).toBe('Deploy on Fridays only after the smoke test passes.')
+    expect(page.hits[0]!.snippet).not.toContain('name:')
+    expect(await f.api.get({ ref: page.hits[0]!.entry.ref })).toMatchObject({ entry: { label: 'Deployment rules' } })
+    expect((await f.api.search({ query: 'production' })).hits.map((hit) => hit.entry.label)).toEqual([
+      'Deployment rules'
+    ])
+    expect((await f.api.search({ query: 'nothing-like-this' })).hits).toEqual([])
+    expect((await f.api.search({ query: 'fridays', limit: 1 })).hits).toHaveLength(1)
+    await expect(f.api.search({ query: '' })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    await expect(f.api.search({ query: 'x', limit: 21 })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+  })
+
+  it('managed search sees the channel overlay and keeps the generated index out of hits', async () => {
+    const f = await fixture('managed', 0)
+    await f.root.writeFile('memory/MEMORY.md', '# Index\n- shared secret phrase\n')
+    await f.root.writeFile('memory/topic.md', 'base shared secret phrase\n')
+    await f.root.writeFile('channels/c1/memory/topic.md', 'channel override without the phrase\n')
+    await f.root.writeFile('channels/c1/memory/extra.md', 'channel-only shared secret phrase\n')
+    const view = () => f.provider.entryView({ agentId: 'binding-1', channelKey: 'c1' })
+    const api = await service(f.db, view)
+    const page = await api.search({ query: 'shared secret phrase' })
+    expect(page.hits.map((hit) => [hit.entry.label, hit.entry.origin])).toEqual([['extra', 'active']])
+  })
+
+  it('external search projects recall hits and never claims lexical kind or complete coverage', async () => {
+    const f = await fixture('external', 3)
+    ;(f.admin.capabilities as Set<string>).add('recall')
+    f.admin.search = async (_scope, request) =>
+      [...f.records.values()].filter((record) => record.text.includes(request.query)).slice(0, request.topK)
+    expect((await f.api.describe()).operations).toEqual(['list', 'get', 'search'])
+    const page = await f.api.search({ query: 'Fact 1', limit: 2 })
+    expect(page).toMatchObject({ kind: 'unknown', coverage: 'unknown' })
+    expect(page.hits.map((hit) => hit.snippet)).toEqual(['Fact 1'])
+    expect(await f.api.get({ ref: page.hits[0]!.entry.ref })).toMatchObject({ text: 'Fact 1' })
+  })
+
+  it('projects search through MCP and the admin reader with the same bounded result', async () => {
+    const f = await fixture('managed', 0)
+    await f.root.writeFile('memory/deploy.md', 'Deploy on Fridays.\n')
+    const { executeTool } = await import('../src/mcp/ops.js')
+    const { MEMORY_TOOLS } = await import('../src/memory/tools.js')
+    const ctx = { agentId: 'a', platform: 'slack', isDm: false, channel: 'C', thread: 'T', tools: MEMORY_TOOLS }
+    const deps = { memory: f.provider, memoryEntryStore: f.db } as unknown as import('../src/mcp/ops.js').OpsDeps
+    expect(await executeTool(ctx, 'searchMemoryEntries', { query: 'fridays' }, deps)).toMatchObject({
+      kind: 'lexical',
+      hits: [{ entry: { label: 'deploy' }, snippet: 'Deploy on Fridays.' }]
+    })
+    await expect(
+      executeTool(ctx, 'searchMemoryEntries', { query: 'fridays' }, { ...deps, memoryAccessDecision: () => 'deny' })
+    ).rejects.toThrow()
+    const { createMemoryEntriesReader } = await import('../src/cp/memory-entries.js')
+    const read = createMemoryEntriesReader(f.provider, f.db, (id) => id === 'a')
+    expect(await read({ agentId: 'a', operation: 'search', request: { query: 'fridays', limit: 5 } })).toMatchObject({
+      operation: 'search',
+      result: { kind: 'lexical', coverage: 'complete', hits: [{ snippet: 'Deploy on Fridays.' }] }
+    })
+  })
+})
+
+it('annotates managed reads with one hop of wiki links as refs, never spliced into the text', async () => {
+  const f = await fixture('managed', 0)
+  // The writer pins a header name to its topic slug, so links name slugs.
+  const deployText = '---\nname: deploy\ndescription: Release rules\n---\nSee [[oncall]] and [[missing]].\n'
+  await f.root.writeFile('memory/deploy.md', deployText)
+  await f.root.writeFile('memory/oncall.md', 'Page the [[deploy]] owner.\n')
+  await f.root.writeFile('channels/c1/memory/rota.md', 'Channel rota links to [[deploy]].\n')
+  expect((await f.api.describe()).graph).toBe(true)
+  const page = await f.api.list({ limit: 10 })
+  const deploy = page.entries.find((entry) => entry.label === 'deploy')!
+  const content = (await f.api.get({ ref: deploy.ref }))!
+  expect(content.text).toBe(deployText)
+  expect(content.links).toEqual([
+    { label: 'oncall', ref: expect.any(String), exists: true },
+    { label: 'missing', exists: false }
+  ])
+  expect(content.backlinks).toEqual([{ label: 'oncall', ref: expect.any(String), exists: true }])
+  expect(await f.api.get({ ref: content.links![0]!.ref! })).toMatchObject({ entry: { label: 'oncall' } })
+  await expect(f.api.get({ ref: content.links![0]!.ref!, agentId: 'x' })).rejects.toMatchObject({
+    code: 'INVALID_ARGUMENT'
+  })
+  // The channel view sees the overlay edge and mints refs into its own partition.
+  const overlay = await service(f.db, () => f.provider.entryView({ agentId: 'binding-1', channelKey: 'c1' }))
+  const base = (await overlay.list({ limit: 10 })).entries.find((entry) => entry.label === 'deploy')!
+  const viewed = (await overlay.get({ ref: base.ref }))!
+  expect(viewed.backlinks?.map((edge) => edge.label).sort()).toEqual(['oncall', 'rota'])
+  const rota = viewed.backlinks!.find((edge) => edge.label === 'rota')!
+  expect(await overlay.get({ ref: rota.ref! })).toMatchObject({ entry: { label: 'rota', origin: 'active' } })
+  await expect(f.api.get({ ref: rota.ref! })).rejects.toMatchObject({ code: 'STALE_BINDING' })
 })

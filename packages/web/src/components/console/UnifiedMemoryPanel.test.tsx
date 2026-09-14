@@ -18,11 +18,29 @@ vi.mock('@/lib/api', () => {
     describeAgentMemoryEntries: vi.fn(),
     listAgentMemoryEntries: vi.fn(),
     getAgentMemoryEntry: vi.fn(),
+    searchAgentMemoryEntries: vi.fn(),
     createAgentMemoryEntry: vi.fn(),
     updateAgentMemoryEntry: vi.fn(),
     deleteAgentMemoryEntry: vi.fn()
   }
 })
+// The lazy Markdown view renders as a marked stub; its own behavior is covered by MarkdownView tests.
+vi.mock('next/dynamic', () => ({
+  default:
+    () =>
+    (props: {
+      content: string
+      resolveLink?: (href: string) => { kind: string; onActivate?: () => void } | undefined
+    }) => (
+      <div data-testid="markdown">
+        {props.content}
+        <button type="button" onClick={() => props.resolveLink?.('oncall.md')?.onActivate?.()}>
+          follow oncall.md
+        </button>
+        <span data-testid="stray">{props.resolveLink?.('stray.md')?.kind}</span>
+      </div>
+    )
+}))
 import * as api from '@/lib/api'
 import { UnifiedMemoryPanel } from './UnifiedMemoryPanel'
 const entry = {
@@ -201,4 +219,66 @@ it('refreshes retained tools when switching from a successful entry create', asy
   await click('More memory tools')
   expect(refresh).toHaveBeenCalledTimes(1)
   expect(host.textContent).toContain('Legacy memory tools')
+})
+it('searches only when advertised, shows what a hit can prove, and opens a hit like an entry', async () => {
+  await render()
+  expect(host.querySelector('input[aria-label="Search memory"]')).toBeNull()
+  vi.mocked(api.describeAgentMemoryEntries).mockResolvedValue({
+    ...caps,
+    operations: [...caps.operations, 'search'],
+    searchKind: 'lexical'
+  })
+  vi.mocked(api.searchAgentMemoryEntries).mockResolvedValue({
+    kind: 'lexical',
+    coverage: 'partial',
+    hits: [{ entry: { ...entry, ref: 'hit-ref', label: 'Deploy' }, snippet: '…Deploy on Fridays…' }]
+  })
+  await render('two')
+  const input = host.querySelector('input[aria-label="Search memory"]') as HTMLInputElement
+  expect(input).toBeTruthy()
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'fridays')
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await click('Search')
+  expect(api.searchAgentMemoryEntries).toHaveBeenCalledWith('agent', 'fridays', 'two')
+  expect(host.textContent).toContain('…Deploy on Fridays…')
+  expect(host.textContent).toContain('lexical search · partial coverage')
+  expect(host.textContent).not.toContain('Topic')
+  await click('Deploy')
+  expect(api.getAgentMemoryEntry).toHaveBeenCalledWith('agent', 'hit-ref', 'two', undefined)
+  await click('Clear search')
+  expect(host.textContent).toContain('Topic')
+  expect(host.textContent).not.toContain('Deploy on Fridays')
+})
+it('renders Markdown entries with annotated links, follows only annotated targets, and keeps text entries raw', async () => {
+  vi.mocked(api.getAgentMemoryEntry).mockResolvedValue({
+    entry,
+    text: '# Deploy',
+    complete: true,
+    links: [
+      { label: 'oncall', ref: 'oncall-ref', exists: true },
+      { label: 'missing', exists: false }
+    ],
+    backlinks: [{ label: 'rota', ref: 'rota-ref', exists: true }]
+  })
+  await render()
+  await click('Topic')
+  expect(host.querySelector('[data-testid="markdown"]')?.textContent).toContain('# Deploy')
+  expect(host.querySelector('pre')).toBeNull()
+  expect(host.textContent).toContain('Links: oncall, missing (missing)')
+  expect(host.textContent).toContain('Backlinks: rota')
+  expect(host.querySelector('[data-testid="stray"]')?.textContent).toBe('blocked')
+  await click('rota')
+  expect(api.getAgentMemoryEntry).toHaveBeenLastCalledWith('agent', 'rota-ref', 'one', undefined)
+  await click('follow oncall.md')
+  expect(api.getAgentMemoryEntry).toHaveBeenLastCalledWith('agent', 'oncall-ref', 'one', undefined)
+  vi.mocked(api.getAgentMemoryEntry).mockResolvedValue({
+    entry: { ...entry, format: 'text' },
+    text: 'plain record',
+    complete: true
+  })
+  await click('Topic')
+  expect(host.querySelector('pre')?.textContent).toBe('plain record')
+  expect(host.querySelector('[data-testid="markdown"]')).toBeNull()
 })

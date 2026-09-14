@@ -1,6 +1,6 @@
 # Design: Unified Memory Operations and Context
 
-**Status:** Implementation in progress. Common reads, conditional managed mutations, model/admin projections, and the common console are implemented. Bounded catalog delivery on supported session creation/native resume is implemented; continuously live session refresh and compatibility retirement remain pending. This design does not change the plugin ABI by itself.
+**Status:** Implementation in progress. Common reads, bounded search, conditional managed mutations, external record mutations, model/admin projections, and the common console are implemented. Bounded catalog delivery on supported session creation/native resume is implemented; continuously live session refresh and compatibility retirement remain pending. This design does not change the plugin ABI by itself.
 
 **Related:** [Memory evolution](memory-evolution.md), [managed memory](memory-system-plan.md), [Dream](memory-dreaming.md), [product conventions](../product-conventions.md).
 
@@ -393,7 +393,8 @@ rollout, not the final retirement of legacy tools.
 The descriptor is stable across managed homes; callers use
 `describeMemoryEntries` for live operations and limits before choosing a write.
 Strong mutations still require the atomic home/capture ports, and external/native
-providers gain no new mutation capability. Ordinary model calls bind `tool` source
+providers gained no new mutation capability in this slice (external record
+mutations arrived later, below). Ordinary model calls bind `tool` source
 and the trusted source turn internally. Every mutation goes through the existing
 write-access/approval gate, and the entry service rechecks access before resolving
 the live provider. A one-call approval permits that payload while a subsequent
@@ -524,3 +525,85 @@ runtimes. Until a supported mechanism passes those checks, new/native-resumed
 sessions receive the bounded observation and live sessions retrieve current
 entries through the common tools. Compatibility retirement is also still pending;
 this audit does not close the overall unified-memory implementation task.
+
+### External entry mutation projection
+
+External v1 connections now project their declared `create`, `update`, and
+`delete` operations through the same entry service, adapter port, model tools,
+admin routes, and console browser. Capabilities stay truthful:
+`writeConsistency: 'last-write-wins'`, `exactCreate: false`, and
+`exactEdit: false`, because a v1 manifest proves neither atomic conditional
+writes nor verbatim storage of authored text. A record backend takes no label (a
+supplied label is refused, never dropped), stores plain text, forwards optional
+metadata, and treats omitted metadata as preserve. Exact edits are refused with
+`UNSUPPORTED`; empty text is refused rather than treated as deletion.
+
+A supplied revision travels to the backend as its optional `version`; a reported
+conflict returns `CONFLICT` with the current revision when `get` can supply it.
+Without a revision the write is last-write-wins, as advertised. Core assigns the
+operation ID before egress. A lost or malformed reply after egress is
+`AMBIGUOUS_WRITE`, never a blind replay, because the profile has no
+operation-status lookup for record writes. Connection loss before egress,
+oversized payloads, and a backend `deleted: false` map to `UNAVAILABLE`,
+`TOO_LARGE`, and `NOT_FOUND`.
+
+Mutations are projected only for callers that carry write provenance (`tool` for
+ordinary sessions, `console` for the authorized BFF); read-only views advertise no
+write operation and mark entries non-editable. The private-session write gate and
+approval card apply unchanged; the approval pre-check compares a revision only
+when the request supplies one, since conditional homes still require it at write
+time. Legacy `saveMemory`/`updateMemory`/`deleteMemory` keep their record-id
+contracts for warm sessions. External Dream, channel scope, and capture remain
+unchanged.
+
+### Unified search projection
+
+`searchMemoryEntries`, `POST /agents/:id/memory/entries/search`, and the console
+search box project one bounded retrieval operation over the authorized view. A
+request carries a query and a hit limit (default 5, at most 20); a result carries
+hits with an entry summary and a snippet, the search `kind` (`lexical`,
+`semantic`, `hybrid`, or `unknown`) and `coverage` (`complete`, `partial`, or
+`unknown`). Search is never enumeration: the tool description, the console note,
+and the result fields all say so, and hits resolve through the same refs as
+`listMemoryEntries`.
+
+Managed memory advertises `searchKind: 'lexical'`: every whitespace-separated
+term must occur, case-insensitively, in the topic label, description, or body
+(frontmatter excluded), scored by where it matched and ordered
+deterministically by score then topic name. The scan runs under the store lock
+in topic order across the channel overlay and the same catalog budget as
+enumeration; exhausting that budget or skipping an oversized topic reports
+`partial` coverage rather than hiding it. Snippets are bounded windows around the
+first body match. No index, vector store, or semantic claim is involved.
+
+External v1 connections that declare `recall` advertise `search` without a
+`searchKind`, because the manifest does not state the backend's retrieval kind;
+results report `unknown` kind and coverage, with the record text prefix as the
+snippet. The recall call is bounded by hit count, byte budget, and timeout, and
+a backend failure is `UNAVAILABLE`, never an empty result.
+
+The search operation rides the `memory/entries/read/v1` frame behind the
+negotiated `memory-entries-search-v1` feature; the Control Plane answers
+`UNSUPPORTED` for an older daemon without sending the frame, and read-only
+callers receive hits with editability removed. Legacy `searchMemory` and the
+record search route remain for warm sessions and older peers.
+
+### Managed graph annotations and console rendering
+
+Managed memory now advertises `graph: true`. A unified `get` annotates the
+entry with one hop of the existing `[[name]]` graph: `links` and `backlinks`
+carry the neighbor's display label, whether it exists, and a ref minted from the
+current authorized view for a target inside that view. Under channel scope the
+walk crosses both overlay layers, so an edge from a channel topic to a shared
+base topic resolves to the layer the overlay would actually serve. A dangling
+link keeps its label with `exists: false` and no ref. Annotations are never
+spliced into `text`, stay bounded to 20 per direction, and are omitted (not
+truncated) when the catalog exceeds the enumeration scan budget. Summaries and
+lists remain free of graph reads; external and native entries advertise no graph.
+
+The unified console reader renders `markdown` entries with the shared Markdown
+view used by the file preview, keeping the raw stored text, frontmatter
+included, as the editable draft; `text` entries stay in the plain block. Link
+and backlink annotations render as in-place actions, and a relative Markdown link
+opens a sibling only through a ref the read already annotated, never by guessing
+a ref or a file path.

@@ -48,6 +48,9 @@ export async function listMemoryEntries(ctx: SessionContext, args: Record<string
 export async function getMemoryEntry(ctx: SessionContext, args: Record<string, unknown>, deps: MemoryOpsDeps) {
   return call(ctx, deps, (service) => service.get(args))
 }
+export async function searchMemoryEntries(ctx: SessionContext, args: Record<string, unknown>, deps: MemoryOpsDeps) {
+  return call(ctx, deps, (service) => service.search(args))
+}
 
 export async function createMemoryEntry(ctx: SessionContext, args: Record<string, unknown>, deps: MemoryOpsDeps) {
   return call(ctx, deps, (service) => service.create(args))
@@ -72,7 +75,8 @@ export async function memoryEntryWriteAsk(
   return call(ctx, deps, async (service) => {
     const current = await service.get({ ref: request.ref, maxBytes: 32768 })
     if (!current) throw new MemoryEntriesError('NOT_FOUND', 'memory entry no longer exists')
-    if (current.entry.revision !== request.revision)
+    // A supplied revision must match what the human will approve; conditional homes require one at write time.
+    if (request.revision !== undefined && current.entry.revision !== request.revision)
       throw new MemoryEntriesError(
         'CONFLICT',
         'memory entry changed; read it again before requesting approval',

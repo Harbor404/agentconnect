@@ -1,18 +1,34 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import type { MemoryEntryCapabilities, MemoryEntryContent, MemoryEntrySummary } from '@agentconnect.md/protocol'
+import dynamic from 'next/dynamic'
+import type {
+  MemoryEntryCapabilities,
+  MemoryEntryContent,
+  MemoryEntryLink,
+  MemoryEntrySearchHit,
+  MemoryEntrySummary
+} from '@agentconnect.md/protocol'
 import {
   ApiError,
   describeAgentMemoryEntries,
   listAgentMemoryEntries,
   getAgentMemoryEntry,
+  searchAgentMemoryEntries,
   createAgentMemoryEntry,
   updateAgentMemoryEntry,
   deleteAgentMemoryEntry
 } from '@/lib/api'
 import { readCompleteMemoryEntry } from '@/lib/memory-entry-content'
 import { Button } from '@/components/ui'
+import { memoryFileFromHref } from '@/components/console/memory-links'
+import { resolveFileBrowserMarkdownLink } from '@/components/console/file-browser-links'
+
+// Loaded lazily like the file preview so react-markdown never ships in the main console bundle.
+const MarkdownView = dynamic(() => import('@/components/console/MarkdownView'), {
+  ssr: false,
+  loading: () => <p className="text-(--text-tertiary)">Rendering…</p>
+})
 
 interface Props {
   agentId: string
@@ -37,6 +53,12 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : 'Memory is unavailable.'
 }
+// A Markdown link opens a sibling only through a ref the read already annotated; refs are never guessed.
+function linkedRef(document: MemoryEntryContent, name: string): string | undefined {
+  const label = name.replace(/\.md$/, '')
+  return [...(document.links ?? []), ...(document.backlinks ?? [])].find((edge) => edge.ref && edge.label === label)
+    ?.ref
+}
 function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props) {
   const generation = useRef(0)
   const detailRequest = useRef(0)
@@ -44,6 +66,9 @@ function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props
   const [legacy, setLegacy] = useState(false)
   const [entries, setEntries] = useState<MemoryEntrySummary[]>([])
   const [cursor, setCursor] = useState<string>()
+  const [query, setQuery] = useState('')
+  const [hits, setHits] = useState<MemoryEntrySearchHit[] | null>(null)
+  const [searchNote, setSearchNote] = useState<string>()
   const [busy, setBusy] = useState(true)
   const [reading, setReading] = useState(false)
   const [error, setError] = useState<string>()
@@ -62,6 +87,8 @@ function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props
       setReading(false)
       setBusy(true)
       setError(undefined)
+      setHits(null)
+      setSearchNote(undefined)
       try {
         const caps = await describeAgentMemoryEntries(agentId, channelKey)
         if (id !== generation.current) return
@@ -113,7 +140,27 @@ function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props
       if (id === generation.current) setBusy(false)
     }
   }
-  async function open(entry: MemoryEntrySummary) {
+  // A search is retrieval over the authorized view, never a listing; the note says what it can prove.
+  async function search() {
+    const id = generation.current
+    const text = query.trim()
+    if (!text) return
+    setBusy(true)
+    setError(undefined)
+    try {
+      const result = await searchAgentMemoryEntries(agentId, text, channelKey)
+      if (id !== generation.current) return
+      setHits(result.hits)
+      setSearchNote(
+        `${result.hits.length} ${result.hits.length === 1 ? 'hit' : 'hits'} · ${result.kind} search · ${result.coverage} coverage. A search is not a complete listing.`
+      )
+    } catch (err) {
+      if (id === generation.current) setError(errorMessage(err))
+    } finally {
+      if (id === generation.current) setBusy(false)
+    }
+  }
+  async function open(entry: Pick<MemoryEntrySummary, 'ref'>) {
     const id = ++detailRequest.current
     setReading(true)
     setDocument(null)
@@ -251,6 +298,46 @@ function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props
           </Button>
         </div>
       </div>
+      {capabilities?.operations.includes('search') && (
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <input
+            aria-label="Search memory"
+            placeholder="Search memory"
+            value={query}
+            maxLength={2048}
+            disabled={busy || saving}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                void search()
+              }
+            }}
+            className="min-w-0 flex-1 rounded-sm border border-(--border-subtle) bg-(--surface-card) p-2"
+          />
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={busy || saving || !query.trim()}
+            onClick={() => void search()}
+          >
+            Search
+          </Button>
+          {hits && (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={busy || saving}
+              onClick={() => {
+                setHits(null)
+                setSearchNote(undefined)
+              }}
+            >
+              Clear search
+            </Button>
+          )}
+        </div>
+      )}
       {notice && <p role="status">{notice}</p>}
       {error && (
         <p role="alert" className="text-(--text-secondary)">
@@ -260,22 +347,36 @@ function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props
       <div className="grid gap-4 desktop:grid-cols-[240px_minmax(0,1fr)]">
         <div className="flex flex-col gap-2">
           {busy && <p role="status">Loading memory…</p>}
-          {!busy && !error && entries.length === 0 && <p>No memory entries on this page.</p>}
-          {entries.map((entry, index) => (
+          {hits && searchNote && <p className="text-[11px] text-(--text-secondary)">{searchNote}</p>}
+          {!busy && !error && hits && hits.length === 0 && <p>No memory matched this search.</p>}
+          {hits?.map((hit, index) => (
             <button
-              key={`${entry.ref}:${index}`}
+              key={`${hit.entry.ref}:${index}`}
               className="rounded-sm border border-(--border-subtle) p-2 text-left text-(--text-primary) hover:bg-(--surface-hover) disabled:opacity-50"
               disabled={saving || (!!mode && !blocked)}
-              onClick={() => void open(entry)}
+              onClick={() => void open(hit.entry)}
             >
-              <span className="block break-words font-semibold">{entry.label ?? 'Untitled memory'}</span>
-              <span className="text-[11px] text-(--text-secondary)">
-                {entry.origin === 'active' ? '' : 'Inherited · '}
-                {entry.byteSize} bytes
-              </span>
+              <span className="block break-words font-semibold">{hit.entry.label ?? 'Untitled memory'}</span>
+              <span className="block break-words text-[11px] text-(--text-secondary)">{hit.snippet}</span>
             </button>
           ))}
-          {cursor && (
+          {!busy && !error && !hits && entries.length === 0 && <p>No memory entries on this page.</p>}
+          {!hits &&
+            entries.map((entry, index) => (
+              <button
+                key={`${entry.ref}:${index}`}
+                className="rounded-sm border border-(--border-subtle) p-2 text-left text-(--text-primary) hover:bg-(--surface-hover) disabled:opacity-50"
+                disabled={saving || (!!mode && !blocked)}
+                onClick={() => void open(entry)}
+              >
+                <span className="block break-words font-semibold">{entry.label ?? 'Untitled memory'}</span>
+                <span className="text-[11px] text-(--text-secondary)">
+                  {entry.origin === 'active' ? '' : 'Inherited · '}
+                  {entry.byteSize} bytes
+                </span>
+              </button>
+            ))}
+          {!hits && cursor && (
             <Button variant="secondary" size="sm" disabled={busy || saving} onClick={() => void more()}>
               Load more
             </Button>
@@ -288,7 +389,7 @@ function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props
             <>
               {mode === 'create' && (
                 <label className="mb-2 block">
-                  Name
+                  Name (optional)
                   <input
                     aria-label="Memory name"
                     value={label}
@@ -339,9 +440,57 @@ function Entries({ agentId, channelKey, canEdit, children, onOpenLegacy }: Props
           ) : document ? (
             <>
               <h4 className="mt-0 break-words">{document.entry.label ?? 'Memory'}</h4>
-              <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-(--surface-sunken) p-3 font-mono text-[12px] leading-[1.5]">
-                {document.text}
-              </pre>
+              {document.entry.format === 'markdown' ? (
+                <div className="max-h-96 overflow-auto rounded-sm bg-(--surface-sunken) px-3 py-2">
+                  <MarkdownView
+                    content={document.text}
+                    resolveLink={(href) =>
+                      resolveFileBrowserMarkdownLink(
+                        href,
+                        (candidate) => {
+                          const name = memoryFileFromHref(candidate)
+                          const ref = name ? linkedRef(document, name) : undefined
+                          return name && ref ? { path: name, name, ref } : null
+                        },
+                        (target) => void open({ ref: target.ref })
+                      )
+                    }
+                  />
+                </div>
+              ) : (
+                <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-(--surface-sunken) p-3 font-mono text-[12px] leading-[1.5]">
+                  {document.text}
+                </pre>
+              )}
+              {(
+                [
+                  ['Links', document.links],
+                  ['Backlinks', document.backlinks]
+                ] as Array<[string, MemoryEntryLink[] | undefined]>
+              ).map(([title, edges]) =>
+                edges?.length ? (
+                  <p key={title} className="my-2 text-[12px]">
+                    <span className="font-semibold">{title}:</span>{' '}
+                    {edges.map((edge, index) => (
+                      <span key={`${edge.label}:${index}`}>
+                        {index > 0 ? ', ' : ''}
+                        {edge.ref ? (
+                          <button
+                            type="button"
+                            className="underline"
+                            disabled={saving || (!!mode && !blocked)}
+                            onClick={() => void open({ ref: edge.ref! })}
+                          >
+                            {edge.label}
+                          </button>
+                        ) : (
+                          <span className="text-(--text-tertiary)">{edge.label} (missing)</span>
+                        )}
+                      </span>
+                    ))}
+                  </p>
+                ) : null
+              )}
               <div className="flex flex-wrap gap-2">
                 {supports('update') && editable && (
                   <Button
