@@ -416,8 +416,13 @@ export class PermissionCoordinator {
   /** Re-derive the session's wait state after a map write and report it when it flipped (§7). `closed`
    *  names the gate this write removed, so the turn's surface closes that one gate, not the session. */
   private syncApprovalActivity(owner: HostKey, sessionId: string, closed?: ClosedGate): void {
-    if (closed) this.reportGateClosed(owner, sessionId, closed)
     const key = pendingTurnKey(owner, sessionId)
+    if (closed) {
+      // Any settled human wait — approval, form, URL consent — restarts the stall watchdog's clock (#1915).
+      const turn = this.host.pending().get(key)
+      if (turn) turn.runtimeActivityAt = this.host.clock().now()
+      this.reportGateClosed(owner, sessionId, closed)
+    }
     const awaiting = this.hasPendingApproval(owner, sessionId)
     if (awaiting === this.awaitingApproval.has(key)) return
     if (awaiting) this.awaitingApproval.set(key, { owner, agentId: hostKeyAgentId(owner), sessionId })
@@ -539,6 +544,16 @@ export class PermissionCoordinator {
         delete a.startedAt
       }
     }
+  }
+
+  /** A permission card or elicitation for `sessionId` still awaits a human — that wait is not the runtime's (#1915). */
+  awaitingHuman(owner: HostKey, sessionId: string): boolean {
+    const mine = (pending: { owner: HostKey; sessionId: string }): boolean =>
+      pending.owner === owner && pending.sessionId === sessionId
+    for (const pending of this.pendingChatPermissions.values()) if (mine(pending)) return true
+    for (const pending of this.pendingEditorPermissions.values()) if (mine(pending)) return true
+    for (const pending of this.pendingElicits.values()) if (mine(pending)) return true
+    return false
   }
 
   private async awaitEditorPermission(

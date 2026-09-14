@@ -108,7 +108,13 @@ import {
   type TranscriptRow,
   type StoredUsage
 } from './store/local-store.js'
-import { AcpHost, turnFailureCode, turnFailureReason, undecorateRuntimeError } from './acp/acp-host.js'
+import {
+  AcpHost,
+  turnFailureCode,
+  turnFailureReason,
+  isRuntimeSessionGone,
+  undecorateRuntimeError
+} from './acp/acp-host.js'
 import {
   probeSandboxHost,
   removeHostSandboxState,
@@ -621,6 +627,8 @@ import type { CodeHostReplyTarget } from './codehost/reply-target.js'
 import { codeHostThreadWorktreeCleanup, turnFinalFor } from './codehost/turn-final.js'
 import {
   FailStopError,
+  TurnStalledError,
+  interruptFailsTurn,
   LifecycleCleanupBlockedError,
   pendingSessionKey,
   pendingTurnAcpSessionId,
@@ -11721,7 +11729,7 @@ export class Daemon {
         sessionId
       })
       if (readyGate) {
-        if (readyGate === 'loop protection') settlement.finalPhase = 'problem'
+        if (interruptFailsTurn(readyGate)) settlement.finalPhase = 'problem'
         return null
       }
       turnModel = await this.captureTurnModel(run, host, sessionId, modelOverride)
@@ -12737,6 +12745,8 @@ export class Daemon {
       // Start-fence linearization: no await occurs between queue coalescing above
       // (or the prior regeneration decision) and initiating this ACP request.
       p.promptInFlight = true
+      // The stall watchdog's clock starts with the request, not with the turn's admission.
+      p.runtimeActivityAt = this.clock.now()
       let result: PromptResult
       try {
         result = await host.prompt(sessionId, promptBlocks)
@@ -12754,7 +12764,7 @@ export class Daemon {
       this.runtimeFacts.noteAuthFromTurn(agent.runtime, false)
       if (p.outputSuppressed) {
         evaluation.finishEvaluation('turn.cancelled', { reason: p.outputSuppressed })
-        if (p.outputSuppressed === 'loop protection') settlement.finalPhase = 'problem'
+        if (interruptFailsTurn(p.outputSuppressed)) settlement.finalPhase = 'problem'
         if (hookContext && this.reportsHookOutcome(entry)) {
           await this.emitHookCompletion(hookContext, 'failed', { sessionId, reason: p.outputSuppressed }, entry)
         }
@@ -12810,7 +12820,7 @@ export class Daemon {
       if (p.outputSuppressed) {
         this.discardStagedAttempt(p)
         evaluation.finishEvaluation('turn.cancelled', { reason: p.outputSuppressed })
-        if (p.outputSuppressed === 'loop protection') settlement.finalPhase = 'problem'
+        if (interruptFailsTurn(p.outputSuppressed)) settlement.finalPhase = 'problem'
         if (hookContext && this.reportsHookOutcome(entry)) {
           await this.emitHookCompletion(hookContext, 'failed', { sessionId, reason: p.outputSuppressed }, entry)
         }
@@ -13202,6 +13212,24 @@ export class Daemon {
     }
   }
 
+  /** The runtime no longer has `sessionId`: drop the host's claim and the row's id so the next message recreates it (#1915). */
+  private async forgetGoneRuntimeSession(p: Pending, sessionId: string): Promise<void> {
+    const key = p.plan.sessionKey
+    ;(p.selectedHost?.host ?? this.hostForOwner(p.hostKey))?.forgetSession(sessionId)
+    const rec = await this.store.getSession(key)
+    if (rec?.acpSessionId !== sessionId) return
+    await this.store.upsertSession({
+      ...rec,
+      acpSessionId: null,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: this.clock.now()
+    })
+    this.log.warn(
+      `turn: runtime no longer has session ${sessionId} for ${key} — cleared it; the next message opens a fresh session`
+    )
+  }
+
   /** Surface a turn that failed before yielding a clean stop — the agent couldn't start (spawn
    *  failure / ACP handshake), or the prompt itself rejected. Without surfacing it here the
    *  failure is invisible: Slack keeps its "is thinking…" status with no message, and a webchat
@@ -13230,7 +13258,7 @@ export class Daemon {
       this.runtimeFacts.noteAuthFromTurn(agent.runtime, true)
     if (p.outputSuppressed) {
       evaluation.finishEvaluation('turn.cancelled', { reason: p.outputSuppressed })
-      if (p.outputSuppressed === 'loop protection') settlement.finalPhase = 'problem'
+      if (interruptFailsTurn(p.outputSuppressed)) settlement.finalPhase = 'problem'
       if (hookContext && this.reportsHookOutcome(entry)) {
         await this.emitHookCompletion(hookContext, 'failed', { sessionId, reason: p.outputSuppressed }, entry)
       }
@@ -13243,6 +13271,8 @@ export class Daemon {
     settlement.propagatingTurnError = true
     evaluation.failEvaluation(err)
     settlement.finalPhase = 'problem'
+    // "Session not found" would repeat on every later dispatch; forget the id instead (#1915).
+    if (isRuntimeSessionGone(err)) await this.forgetGoneRuntimeSession(p, sessionId)
     if (p.webchat?.continuation) {
       // Continuation: release any held stream text; the platform branch below owns the
       // visible notice + transcript, and the terminal-error `done` waits behind its
@@ -13602,8 +13632,16 @@ export class Daemon {
       handoffInbox?: boolean
       /** The human who raised it, when one did — recorded in the transcript. */
       actor?: InteractionActor
+      /** Interrupt only while THIS turn is still the live one under `acpSessionId` (the stall watchdog's exact target). */
+      only?: Pending
     } = {}
   ): Promise<void> {
+    const exact = (): boolean =>
+      !opts.only ||
+      (acpSessionId !== undefined &&
+        this.pending.get(pendingTurnKey(this.sessionOwnerKey(agentId, key), acpSessionId)) === opts.only)
+    // The target already unwound and the ACP id now belongs to a successor: nothing here is ours to interrupt.
+    if (!exact()) return
     // The force-cancel fallback is host-wide. Hold NEW admissions until this exact
     // dispatch is gone so a quick retry cannot be killed by the old turn's backstop.
     this.beginSafetyDrain(
@@ -13654,6 +13692,8 @@ export class Daemon {
       ? this.pending.get(pendingTurnKey(this.sessionOwnerKey(agentId, key), acpSessionId))
       : [...this.pending.values()].find((pending) => pending.plan.sessionKey === key)
     const liveSessionId = acpSessionId ?? live?.acpSessionId
+    // Re-checked after the awaits above; the target's own Pending was suppressed before they began.
+    if (!exact()) return
     if (live) {
       await this.settleStatusBar(live)
       live.outputSuppressed ??= reason
@@ -13700,17 +13740,21 @@ export class Daemon {
     // Release any card the user hasn't answered: ACP requires pending permission /
     // elicitation requests to resolve cancelled when a turn is cancelled, and this lets
     // the agent's prompt unwind (it's blocked awaiting our promise) so the finally runs.
+    // Everything from here is keyed by session id, which a successor turn reuses: recheck after every await.
+    if (!exact()) return
     await this.permissions.releaseElicits(live.hostKey, liveSessionId)
     await this.permissions.releaseChatPermissions(live.hostKey, liveSessionId)
     await this.permissions.releaseEditorPermissions(live.hostKey, liveSessionId)
+    if (!exact()) return
     // §7.3 idle→cancelling: send session/cancel, then arm a force backstop. The turn's
     // dispatch finally clears the timer + writes the terminal idle state when the agent
     // yields; if it never does, the backstop force-stops the host.
     await this.store.setSessionState(key, 'cancelling', this.clock.now())
+    if (!exact()) return
     void (live.selectedHost?.host ?? this.hostForOwner(live.hostKey))
       ?.cancel(liveSessionId)
       .catch((err) => this.log.error(`command ${reason}: cancel failed: ${(err as Error).message}`))
-    this.armCancelBackstop(live.hostKey, liveSessionId, key, reason)
+    this.armCancelBackstop(live.hostKey, liveSessionId, key, reason, opts.only)
     await this.recordOperatorInterrupt(agentId, reason, opts.actor, anchor)
   }
 
@@ -13786,7 +13830,7 @@ export class Daemon {
    *  cancel — force-stop its host (the only hard kill available) so the session
    *  can't be stuck in `cancelling` forever. dispatch's finally clears this timer
    *  the moment the turn yields on its own. */
-  private armCancelBackstop(owner: HostKey, acpSessionId: string, key: string, reason: string): void {
+  private armCancelBackstop(owner: HostKey, acpSessionId: string, key: string, reason: string, only?: Pending): void {
     const agentId = hostKeyAgentId(owner)
     this.clearCancelBackstop(owner, acpSessionId)
     const ms = this.cfg.limits.cancelBackstopMs
@@ -13800,7 +13844,8 @@ export class Daemon {
           `${reason}: agent "${agentId}" ignored session/cancel for ${ms}ms — force-stopping host (session ${acpSessionId})`
         )
         const turn = this.pending.get(pendingKey)
-        if (!turn) return
+        // A successor that reused the ACP id is not the turn this backstop was armed for.
+        if (!turn || (only && turn !== only)) return
         // Force-stop the exact process selected for this turn.
         const cleanup = turn.selectedHost?.stop(0) ?? this.stopHost(agentId, 0)
         const stopped = cleanup.catch((err) => {
@@ -15159,6 +15204,8 @@ export class Daemon {
       return
     }
     const p = this.pending.get(pendingTurnKey(owner, sessionId))
+    // Any update — text, thought, tool call, usage — is proof the runtime is alive on this turn.
+    if (p) p.runtimeActivityAt = this.clock.now()
     this.evalHooks.emit({
       type: 'acp.update',
       agentId,
@@ -16540,6 +16587,9 @@ export class Daemon {
    *  docs/designs/background-task-aware-reclaim.md). */
   private async onSdkLifecycle(owner: HostKey, acpSessionId: string, message: unknown): Promise<void> {
     const agentId = hostKeyAgentId(owner)
+    // A lifecycle message is runtime activity too, even when nothing streams to the surface.
+    const liveTurn = this.pending.get(pendingTurnKey(owner, acpSessionId))
+    if (liveTurn) liveTurn.runtimeActivityAt = this.clock.now()
     const m = message as {
       type?: unknown
       subtype?: unknown
@@ -17559,8 +17609,58 @@ export class Daemon {
     if (this.sessionPurgeDrainRerun) await this.drainSessionPurges()
   }
 
+  /** Stall watchdog (#1915, daemon-detailed-design.md §7.3): cancel a prompt with no runtime signal for `turnStallTimeoutMs`. */
+  private async sweepStalledTurns(now: number): Promise<void> {
+    const budget = this.cfg.limits.turnStallTimeoutMs
+    if (budget <= 0) return
+    for (const p of [...this.pending.values()]) {
+      if (!p.promptInFlight || p.outputSuppressed || p.runtimeActivityAt === undefined) continue
+      // A card the human has not answered is the human's time, not the runtime's.
+      if (p.approval.depth > 0 || this.permissions.awaitingHuman(p.hostKey, p.acpSessionId)) continue
+      const silentMs = now - p.runtimeActivityAt
+      if (silentMs < budget) continue
+      await this.tripStalledTurn(p, silentMs)
+    }
+  }
+
+  /** Own the exact turn before anything yields, cancel it the way `!stop` does, then tell the conversation. */
+  private async tripStalledTurn(p: Pending, silentMs: number): Promise<void> {
+    const { agentId, sessionKey } = p.plan
+    const { msg } = p.entry
+    // Synchronous: a prompt that returns inside the window below is dropped as stalled, never delivered.
+    p.outputSuppressed ??= 'stalled'
+    this.log.warn(
+      `turn watchdog: session ${sessionKey} (${p.acpSessionId}) has had no runtime activity for ` +
+        `${Math.round(silentMs / 60_000)} min — cancelling the stalled turn`
+    )
+    const err = new TurnStalledError(silentMs)
+    // The browser's terminal frame carries the reason; the interrupt would otherwise send a bare one.
+    if (p.webchat && !p.webchat.doneSent) {
+      p.webchat.doneSent = true
+      p.webchat.sink.done({ conversationId: p.webchat.conversationId, turnId: p.webchat.turnId, error: err.message })
+    }
+    // session/cancel, the cancelBackstopMs force-stop if ignored, queued messages fail-stopped (§6.9).
+    await this.interruptTurn(agentId, sessionKey, 'stalled', p.acpSessionId, { only: p })
+    // Notice I/O only after the fence stands: the platform post, failure sinks, and the transcript row.
+    await this.surfaceTurnFailure(err, {
+      agentId,
+      agentName: p.plan.agentName,
+      ...(p.plan.iconUrl ? { iconUrl: p.plan.iconUrl } : {}),
+      platform: msg.platform,
+      isDm: msg.isDm,
+      ...(p.conn ? { replyConn: p.conn } : {}),
+      ...(p.plan.integrationId !== undefined ? { integrationId: p.plan.integrationId } : {}),
+      channel: msg.channel,
+      sessionKey,
+      transcriptChannel: p.plan.transcriptChannel,
+      thread: msg.thread,
+      statusThread: p.plan.statusThread
+    })
+  }
+
   private async sweepIdle(): Promise<void> {
     const now = this.clock.now()
+    await this.sweepStalledTurns(now)
     // Probe temp roots re-created by a runtime that outlived its adapter (see
     // sweepStaleProbeRoots) must be reclaimed inside THIS process's lifetime — the
     // startup pass alone would let a long-lived daemon accumulate them indefinitely.
