@@ -108,13 +108,27 @@ export interface AppToolCall {
 }
 
 export interface McpAppsHostDeps {
-  /** The daemon's configured servers, already validated — read through a function so a config
-   *  reload is picked up without rebuilding the host. Only `ui` ones are ever dialed.
+  /**
+   * The servers visible to ONE ORGANIZATION — daemon-local config overlaid with whatever the CP
+   * pushed for that org — read through a function so a config reload or a CP push is picked up
+   * without rebuilding the host. Only `ui` ones are ever dialed.
    *
-   *  DAEMON-LOCAL definitions only, in v1. A CP-pushed definition is org-scoped, so hosting one
-   *  would mean a connection per organization and a credential boundary between them; until that
-   *  exists, a `ui` server must be configured on the daemon that hosts it. */
-  defs: () => Record<string, McpServerDef>
+   * Org-scoped rather than daemon-wide because a CP definition is: two organizations may each
+   * have a server named `charts` pointing at different relay proxies under different grants, and a
+   * single map keyed by name alone would let one org's connection answer the other's calls.
+   * `undefined` is the daemon-local-only view, which is what a session with no CP org has.
+   */
+  defs: (orgId: string | undefined) => Record<string, McpServerDef>
+  /**
+   * Whether this org's view of `name` is that ORG'S OWN definition rather than daemon-local config.
+   *
+   * It decides what a connection is keyed by, and getting it wrong is invisible: a daemon-local
+   * server is ONE server every organization shares, so keying it per org would dial it once per
+   * org and — worse — leave a session that warmed it under one scope unable to find it under
+   * another. A CP definition genuinely is per-org and must not be shared. Absent ⇒ everything is
+   * treated as local, which is a daemon with no CP.
+   */
+  orgScoped?: (orgId: string | undefined, name: string) => boolean
   log?: Logger
   /** The host's own version, sent as client info. */
   version?: string
@@ -122,30 +136,83 @@ export interface McpAppsHostDeps {
   resolveStdioCommand?: (command: string, env: McpServerDef['env']) => string
 }
 
+/** The key one connection is held under. `\0` cannot occur in either half, so the pair cannot be
+ *  spelled two ways. The scope is the definition's OWNER — an org for a CP-pushed definition,
+ *  nothing for a daemon-local one, which every organization shares. */
+export function connKey(scope: string | undefined, server: string): string {
+  return `${scope ?? ''}\u0000${server}`
+}
+
+/**
+ * Which scope a connection for (org, name) belongs to — the decision the key above is built from,
+ * exported because it is the whole of what separates "one server every org shares" from "that
+ * org's own server", and getting it wrong is silent in both directions: key a local server per org
+ * and a session that warmed it under one scope cannot find it under another; key a CP server
+ * without one and two organizations share a connection authorized for only one of them.
+ */
+export function connScope(orgScoped: boolean, orgId: string | undefined): string | undefined {
+  return orgScoped ? orgId : undefined
+}
+
+/**
+ * What makes one live connection the RIGHT connection for a definition.
+ *
+ * A proxied definition's bearer is rotated by the CP: the name and the url stay put while the
+ * grant behind them is replaced, so a connection cached by name alone keeps presenting a
+ * credential the relay has already retired, and every later call fails — in new sessions too,
+ * because the connection outlives them. Comparing the definition is what makes a rotation re-dial.
+ */
+export function connFingerprint(def: McpServerDef): string {
+  return JSON.stringify([def.transport, def.command, def.args, def.env, def.url, def.headers])
+}
+
 /** One live upstream connection, or the reason there isn't one. */
 interface Conn {
   client: Client
+  /** The definition this connection was dialed for; a change means re-dial (see fingerprint). */
+  fingerprint: string
   tools: Map<string, UpstreamTool>
   templates: Map<string, Template>
 }
 
 export class McpAppsHost {
   private readonly conns = new Map<string, Conn>()
-  private readonly dialing = new Map<string, Promise<Conn | undefined>>()
+  /** In-flight dials, each remembering WHICH definition it is dialing. A dial is only joinable by
+   *  a caller wanting that same definition — see {@link connect}. */
+  private readonly dialing = new Map<string, { fingerprint: string | undefined; promise: Promise<Conn | undefined> }>()
 
   constructor(private readonly deps: McpAppsHostDeps) {}
 
-  /** The configured servers that are daemon-hosted rather than runtime-attached. */
-  uiServers(): string[] {
-    return Object.entries(this.deps.defs())
+  /** The scope a connection for (org, name) is held under — see {@link McpAppsHostDeps.orgScoped}. */
+  private scopeOf(orgId: string | undefined, server: string): string | undefined {
+    return connScope(this.deps.orgScoped?.(orgId, server) === true, orgId)
+  }
+
+  /**
+   * What makes one live connection the RIGHT connection for a definition.
+   *
+   * A proxied definition's bearer is rotated by the CP: the name and the url stay put while the
+   * grant behind them is replaced, so a connection cached by name alone keeps presenting a
+   * credential the relay has already retired, and every later call fails — in new sessions too,
+   * because the connection outlives them. Comparing the definition itself is what makes a rotation
+   * re-dial instead.
+   */
+  private static fingerprint(def: McpServerDef): string {
+    return connFingerprint(def)
+  }
+
+  /** The servers one organization has that are daemon-hosted rather than runtime-attached. */
+  uiServers(orgId: string | undefined): string[] {
+    return Object.entries(this.deps.defs(orgId))
       .filter(([, def]) => def.ui === true)
       .map(([name]) => name)
   }
 
-  /** Whether one configured name is a daemon-hosted UI server — what `resolveAgentMcpServers`
-   *  asks so it never hands the same server to the runtime as well. */
-  isUiServer(name: string): boolean {
-    return this.deps.defs()[name]?.ui === true
+  /** Whether one name is a daemon-hosted UI server FOR THIS ORG — what `resolveAgentMcpServers`
+   *  asks so it never hands the same server to the runtime as well. The org matters: the same
+   *  name can be an ordinary server in one organization and a hosted one in another. */
+  isUiServer(orgId: string | undefined, name: string): boolean {
+    return this.deps.defs(orgId)[name]?.ui === true
   }
 
   /**
@@ -154,8 +221,8 @@ export class McpAppsHost {
    * {@link cachedToolsFor} answers from whatever has connected by then, and a server that comes up
    * late contributes its tools to the next session rather than delaying this one.
    */
-  warm(): void {
-    for (const name of this.uiServers()) void this.connect(name)
+  warm(orgId: string | undefined): void {
+    for (const name of this.uiServers(orgId)) void this.connect(orgId, name)
   }
 
   /**
@@ -164,11 +231,11 @@ export class McpAppsHost {
    * one that is down, contributes nothing; the warn from {@link dial} is where the reason is said,
    * so this never fails a session for a third party being slow.
    */
-  cachedToolsFor(enabled: readonly string[]): ToolDescriptor[] {
+  cachedToolsFor(orgId: string | undefined, enabled: readonly string[]): ToolDescriptor[] {
     const out: ToolDescriptor[] = []
     for (const name of enabled) {
-      const conn = this.conns.get(name)
-      if (!conn || !this.isUiServer(name)) continue
+      const conn = this.conns.get(connKey(this.scopeOf(orgId, name), name))
+      if (!conn || !this.isUiServer(orgId, name)) continue
       for (const tool of conn.tools.values()) out.push(tool.descriptor)
     }
     return out
@@ -178,11 +245,11 @@ export class McpAppsHost {
    * The bridge-visible descriptors for the UI servers this agent enabled, dialing what is not up
    * yet. The awaiting peer of {@link cachedToolsFor}, for a caller that can afford to wait.
    */
-  async toolsFor(enabled: readonly string[]): Promise<ToolDescriptor[]> {
+  async toolsFor(orgId: string | undefined, enabled: readonly string[]): Promise<ToolDescriptor[]> {
     const out: ToolDescriptor[] = []
     for (const name of enabled) {
-      if (!this.isUiServer(name)) continue
-      const conn = await this.connect(name)
+      if (!this.isUiServer(orgId, name)) continue
+      const conn = await this.connect(orgId, name)
       if (!conn) continue
       for (const tool of conn.tools.values()) out.push(tool.descriptor)
     }
@@ -197,8 +264,13 @@ export class McpAppsHost {
    * leaves a perfectly good tool result, and a reader who is never shown a frame leaves an agent
    * that still has words to answer with (§6).
    */
-  async call(server: string, tool: string, args: Record<string, unknown>): Promise<AppToolCall> {
-    const conn = await this.connect(server)
+  async call(
+    orgId: string | undefined,
+    server: string,
+    tool: string,
+    args: Record<string, unknown>
+  ): Promise<AppToolCall> {
+    const conn = await this.connect(orgId, server)
     if (!conn) throw new Error(`MCP server "${server}" is not reachable`)
     const upstream = conn.tools.get(tool)
     if (!upstream) throw new Error(`MCP server "${server}" does not expose a tool named "${tool}"`)
@@ -217,7 +289,7 @@ export class McpAppsHost {
 
     const title = upstream.title ?? tool
     if (!upstream.templateUri || isError) return { content, isError, title }
-    const template = await this.template(server, upstream.templateUri)
+    const template = await this.template(orgId, server, upstream.templateUri)
     if (!template) {
       this.deps.log?.warn(
         `mcp apps: tool "${server}${APP_TOOL_SEPARATOR}${tool}" declares ${upstream.templateUri} but its template could not be read — declining it`
@@ -260,8 +332,8 @@ export class McpAppsHost {
    * cross-server call impossible rather than merely detected — a name like `secrets__read` is
    * looked up on this card's server, does not exist there, and is refused.
    */
-  async resolveViewTool(server: string, name: string): Promise<string | undefined> {
-    const conn = await this.connect(server)
+  async resolveViewTool(orgId: string | undefined, server: string, name: string): Promise<string | undefined> {
+    const conn = await this.connect(orgId, server)
     if (!conn) return undefined
     if (conn.tools.has(name)) return name
     const prefix = `${server}${APP_TOOL_SEPARATOR}`
@@ -280,11 +352,12 @@ export class McpAppsHost {
    * back instead leaves the interface with nothing to render.
    */
   async callForView(
+    orgId: string | undefined,
     server: string,
     tool: string,
     args: Record<string, unknown>
   ): Promise<{ content: unknown[]; structuredContent?: Record<string, unknown>; isError: boolean }> {
-    const conn = await this.connect(server)
+    const conn = await this.connect(orgId, server)
     if (!conn) throw new Error(`MCP server "${server}" is not reachable`)
     if (!conn.tools.has(tool)) throw new Error(`MCP server "${server}" does not expose a tool named "${tool}"`)
     const raw = (await conn.client.callTool(
@@ -299,16 +372,16 @@ export class McpAppsHost {
   }
 
   /** Serve a view's `resources/read`, restricted to the card's own server. */
-  async readResource(server: string, uri: string): Promise<unknown> {
-    const conn = await this.connect(server)
+  async readResource(orgId: string | undefined, server: string, uri: string): Promise<unknown> {
+    const conn = await this.connect(orgId, server)
     if (!conn) throw new Error(`MCP server "${server}" is not reachable`)
     return await conn.client.readResource({ uri }, { timeout: READ_TIMEOUT_MS, maxTotalTimeout: READ_TIMEOUT_MS })
   }
 
   /** Whether a tool of this server declares an interface — what the decline path asks before it
    *  bothers a reader with a notice about a frame they were never going to see. */
-  async declaresInterface(server: string, tool: string): Promise<boolean> {
-    const conn = await this.connect(server)
+  async declaresInterface(orgId: string | undefined, server: string, tool: string): Promise<boolean> {
+    const conn = await this.connect(orgId, server)
     return conn?.tools.get(tool)?.templateUri !== undefined
   }
 
@@ -324,8 +397,8 @@ export class McpAppsHost {
   /** Read one template, cached. Undefined when the read failed, returned something that is not a
    *  single `text/html;profile=mcp-app` document, or exceeded the byte cap — which is DECLINED
    *  rather than truncated, because half a document renders as a broken page (§7.4). */
-  private async template(server: string, uri: string): Promise<Template | undefined> {
-    const conn = await this.connect(server)
+  private async template(orgId: string | undefined, server: string, uri: string): Promise<Template | undefined> {
+    const conn = await this.connect(orgId, server)
     if (!conn) return undefined
     const cached = conn.templates.get(uri)
     if (cached) return cached
@@ -356,18 +429,49 @@ export class McpAppsHost {
   }
 
   /** Dial one configured UI server, at most once concurrently. */
-  private async connect(server: string): Promise<Conn | undefined> {
-    const existing = this.conns.get(server)
-    if (existing) return existing
-    const inflight = this.dialing.get(server)
-    if (inflight) return await inflight
-    const attempt = this.dial(server).finally(() => this.dialing.delete(server))
-    this.dialing.set(server, attempt)
-    return await attempt
+  private async connect(orgId: string | undefined, server: string): Promise<Conn | undefined> {
+    const key = connKey(this.scopeOf(orgId, server), server)
+    const def = this.deps.defs(orgId)[server]
+    const wanted = def ? McpAppsHost.fingerprint(def) : undefined
+
+    const existing = this.conns.get(key)
+    if (existing) {
+      if (wanted !== undefined && existing.fingerprint === wanted) return existing
+      // The definition moved underneath it — a rotated grant, a changed url. Drop the connection
+      // so the dial below presents what the CP is actually expecting now.
+      this.conns.delete(key)
+      void existing.client.close().catch(() => undefined)
+    }
+
+    // A dial already running may be dialing the OLD definition. Joining it would be wrong twice
+    // over: its result carries a credential the CP has already replaced, and — the case that
+    // actually strands a provider — if the retired grant is refused, the fresh definition never
+    // gets a dial of its own and the server stays absent from every later session. So a running
+    // attempt is joinable only by a caller wanting the very definition it is dialing.
+    const inflight = this.dialing.get(key)
+    if (inflight && inflight.fingerprint === wanted) return await inflight.promise
+
+    const attempt: { fingerprint: string | undefined; promise: Promise<Conn | undefined> } = {
+      fingerprint: wanted,
+      promise: Promise.resolve(undefined)
+    }
+    attempt.promise = this.dial(orgId, server).then((conn) => {
+      // Install only while this is still the current attempt. A superseded dial that succeeds
+      // anyway must not overwrite the fresher connection — and must not be left open either.
+      if (this.dialing.get(key) !== attempt) {
+        if (conn) void conn.client.close().catch(() => undefined)
+        return undefined
+      }
+      this.dialing.delete(key)
+      if (conn) this.conns.set(key, conn)
+      return conn
+    })
+    this.dialing.set(key, attempt)
+    return await attempt.promise
   }
 
-  private async dial(server: string): Promise<Conn | undefined> {
-    const def = this.deps.defs()[server]
+  private async dial(orgId: string | undefined, server: string): Promise<Conn | undefined> {
+    const def = this.deps.defs(orgId)[server]
     if (!def || def.ui !== true) return undefined
     let client: Client | undefined
     try {
@@ -389,7 +493,7 @@ export class McpAppsHost {
       if (tools.length > MAX_TOOLS_PER_SERVER) {
         throw new Error(`exposes ${tools.length} tools, past the ${MAX_TOOLS_PER_SERVER} cap`)
       }
-      const conn: Conn = { client, tools: new Map(), templates: new Map() }
+      const conn: Conn = { client, fingerprint: McpAppsHost.fingerprint(def), tools: new Map(), templates: new Map() }
       for (const tool of tools) {
         const templateUri = appTemplateUri(tool)
         conn.tools.set(tool.name, {
@@ -410,7 +514,6 @@ export class McpAppsHost {
           raw: tool
         })
       }
-      this.conns.set(server, conn)
       const withUi = [...conn.tools.values()].filter((t) => t.templateUri).length
       this.deps.log?.info(`mcp apps: hosting "${server}" — ${conn.tools.size} tools, ${withUi} with an interface`)
       return conn

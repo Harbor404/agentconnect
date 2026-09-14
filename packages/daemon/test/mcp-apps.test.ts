@@ -23,7 +23,8 @@ import {
   type AppStream,
   type AppTurn
 } from '../src/mcp/apps/surface.js'
-import { splitAppToolName } from '../src/mcp/apps/host.js'
+import { McpAppsHost, connFingerprint, connKey, connScope, splitAppToolName } from '../src/mcp/apps/host.js'
+import type { McpServerDef } from '../src/config/config-schema.js'
 import {
   appCsp,
   appDimensions,
@@ -165,6 +166,131 @@ describe('resolveAgentMcpServers — a daemon-hosted server is not handed to the
     const servers = resolveAgentMcpServers({ enabled: ['charts'], defs: DEFS, warn })
     expect(servers.map((s) => s.name)).toEqual(['charts'])
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('without its interface'))
+  })
+})
+
+describe('McpAppsHost — org scoping of CP-pushed definitions', () => {
+  const log = () => ({ warn: vi.fn(), debug: vi.fn(), info: vi.fn(), error: vi.fn() }) as never
+  const defsByOrg: Record<string, Record<string, McpServerDef>> = {
+    'org-a': {
+      charts: { transport: 'http', url: 'https://a.example.test/mcp', args: [], env: [], headers: [], ui: true }
+    },
+    'org-b': { charts: { transport: 'http', url: 'https://b.example.test/mcp', args: [], env: [], headers: [] } }
+  }
+  const host = new McpAppsHost({
+    defs: (orgId) => (orgId ? (defsByOrg[orgId] ?? {}) : {}),
+    log: { warn: vi.fn(), debug: vi.fn(), info: vi.fn(), error: vi.fn() } as never
+  })
+
+  it('reads the SAME name differently per organization', () => {
+    // The case a daemon-wide map could not represent: one org hosts `charts`, the other attaches
+    // it to the runtime, and both are correct.
+    expect(host.isUiServer('org-a', 'charts')).toBe(true)
+    expect(host.isUiServer('org-b', 'charts')).toBe(false)
+    expect(host.uiServers('org-a')).toEqual(['charts'])
+    expect(host.uiServers('org-b')).toEqual([])
+  })
+
+  it('keys a daemon-local server in ONE shared bucket and a CP one per org', () => {
+    // The bug this prevents is silent in both directions. Key a local server per org and a session
+    // that warmed it under one scope cannot find it under another, so a CP-managed agent loses its
+    // local UI tools. Key a CP server without one and two organizations share a connection
+    // authorized for only one of them.
+    expect(connScope(false, 'org-a')).toBeUndefined()
+    expect(connScope(false, 'org-b')).toBeUndefined()
+    expect(connKey(connScope(false, 'org-a'), 'clock')).toBe(connKey(connScope(false, 'org-b'), 'clock'))
+    expect(connScope(true, 'org-a')).toBe('org-a')
+    expect(connKey(connScope(true, 'org-a'), 'charts')).not.toBe(connKey(connScope(true, 'org-b'), 'charts'))
+  })
+
+  it('does not join an in-flight dial that is dialing the OLD definition', async () => {
+    // The race that strands a provider: a fresh definition arrives while the retired grant is
+    // still dialing. Joining that attempt means the fresh definition never gets a dial of its own,
+    // so when the retired grant is refused the server is absent from every later session.
+    const def = (bearer: string): McpServerDef => ({
+      transport: 'http',
+      url: 'https://relay.example.test/mcp/p1',
+      args: [],
+      env: [],
+      headers: [{ name: 'Authorization', value: `Bearer ${bearer}` }],
+      ui: true
+    })
+    let current = def('old')
+    const host = new McpAppsHost({
+      defs: () => ({ charts: current }),
+      orgScoped: () => false,
+      log: { warn: vi.fn(), debug: vi.fn(), info: vi.fn(), error: vi.fn() } as never
+    })
+
+    // `dial` has no injection seam in production and does not need one — overriding it on the
+    // instance is enough to drive the ordering this race needs.
+    const dialed: string[] = []
+    const settle: Array<(conn: unknown) => void> = []
+    ;(host as never as { dial: (o: unknown, s: string) => Promise<unknown> }).dial = (_o, server) => {
+      dialed.push(`${server}:${(current.headers ?? [])[0]?.value ?? ''}`)
+      return new Promise((resolve) => settle.push(resolve))
+    }
+
+    const first = host.toolsFor(undefined, ['charts'])
+    expect(dialed).toHaveLength(1)
+
+    current = def('new') // the CP rotated the grant while the first dial is still open
+    const second = host.toolsFor(undefined, ['charts'])
+    expect(dialed).toEqual(['charts:Bearer old', 'charts:Bearer new'])
+
+    // The retired grant is refused, exactly as it would be once revoked.
+    settle[0]!(undefined)
+    await first
+    // The fresh dial is still its own attempt and still installs.
+    settle[1]!({
+      client: { close: async () => undefined },
+      fingerprint: connFingerprint(current),
+      tools: new Map(),
+      templates: new Map()
+    })
+    await second
+    expect(host.cachedToolsFor(undefined, ['charts'])).toEqual([])
+  })
+
+  it('re-dials when a definition changes underneath a live connection', () => {
+    const base = {
+      transport: 'http' as const,
+      url: 'https://relay.example.test/mcp/p1',
+      args: [],
+      env: [],
+      headers: [{ name: 'Authorization', value: 'Bearer old' }]
+    }
+    // A rotated grant keeps the name and the url and replaces only the bearer, which is exactly
+    // the change a connection cached by name alone would never notice.
+    const rotated = { ...base, headers: [{ name: 'Authorization', value: 'Bearer new' }] }
+    expect(connFingerprint(base)).not.toBe(connFingerprint(rotated))
+    expect(connFingerprint(base)).toBe(connFingerprint({ ...base }))
+  })
+
+  it('resolves a daemon-local hosted server for every org, CP-managed or not', () => {
+    // A local server is one server every organization sees. Keying its connection by the caller's
+    // org would dial it once per org and leave a session that warmed it under one scope unable to
+    // find it under another — so a CP-managed agent would silently lose local UI tools.
+    const local: Record<string, McpServerDef> = {
+      clock: { transport: 'http', url: 'https://local.example.test/mcp', args: [], env: [], headers: [], ui: true }
+    }
+    const shared = new McpAppsHost({
+      defs: () => local,
+      // Nothing is org-scoped here: `clock` is daemon-local for every organization.
+      orgScoped: () => false,
+      log: { warn: vi.fn(), debug: vi.fn(), info: vi.fn(), error: vi.fn() } as never
+    })
+    for (const org of ['org-a', 'org-b', undefined]) {
+      expect(shared.isUiServer(org, 'clock')).toBe(true)
+      expect(shared.uiServers(org)).toEqual(['clock'])
+    }
+  })
+
+  it('offers a hosted server only to the org that has it, and none to a daemon with no CP', () => {
+    expect(host.cachedToolsFor('org-b', ['charts'])).toEqual([])
+    // Undefined org = daemon-local only, which here has nothing.
+    expect(host.isUiServer(undefined, 'charts')).toBe(false)
+    expect(host.uiServers(undefined)).toEqual([])
   })
 })
 
