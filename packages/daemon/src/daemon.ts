@@ -461,6 +461,9 @@ import { WorkspaceConflictError } from './cp/workspace-reader.js'
 import { createWorkspaceScope } from './cp/workspace-scope.js'
 import { createWorkspaceFileLinkResolver, type WorkspaceFileLinkResolver } from './messages/workspace-file-links.js'
 import { canonicalWorkspacePath, containedWorkspacePath, WorkspaceViolationError } from './workspace/workspace-files.js'
+import { localWorkspaceFs } from './workspace/workspace-fs.js'
+import type { SaveAttachmentResult } from './mcp/ops/platform-reads.js'
+import { saveAttachmentTo, type SaveAttachmentTarget } from './mcp/ops/save-attachment.js'
 import type { ShareReadResult, ShareTargetResult } from './mcp/ops/share-file.js'
 import { TaskViolationError } from './cp/task-reader.js'
 import {
@@ -3136,6 +3139,45 @@ export class Daemon {
           return { ok: false, reason: 'too-large', detail: `${bytes.byteLength} bytes > ${cap}-byte cap` }
         }
         return imageOf(bytes)
+      },
+      // read*File (inbound-file-attachments.md §2): a downloaded non-image binary lands under
+      // `uploads/` at the session's working root, so the agent's own tools can open it. The same
+      // location resolution as readWorkspaceImage above; the write goes through the WorkspaceFs
+      // seam so a cluster agent's sandbox volume is reached over the fd-anchored channel.
+      saveAttachment: async (ctx, name, bytes): Promise<SaveAttachmentResult> => {
+        const scope = createWorkspaceScope({
+          workspaces: this.workspaces,
+          agentOf: (id) => this.agents.get(id),
+          sessionOf: (id, sessionId) => this.store.getSessionByOutwardId(sessionId, id),
+          runtimeRootOf: (id) => this.k8sPlane?.workspaceRootFor(id)
+        })
+        const row = await this.store
+          .getSession(sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope))
+          .catch(() => undefined)
+        const acpSessionId = row?.sessionId ?? row?.acpSessionId ?? undefined
+        const location =
+          (await scope.location(ctx.agentId, acpSessionId).catch(() => undefined)) ??
+          (await scope.location(ctx.agentId).catch(() => undefined))
+        if (!location) return { ok: false, reason: 'no-workspace' }
+
+        // Pod arm: the sandbox volume over the fd-anchored channel, whose descent is the
+        // containment. Local arm: the daemon's disk, with realpath re-verification of `uploads/`
+        // (the pod-side guarantee the daemon has to supply itself). Anything the seam THROWS
+        // past the helper is the channel (pod) or the disk (local).
+        const pod = this.k8sPlane?.workspaceRootFor(ctx.agentId) !== undefined
+        const placement = pod ? this.k8sPlane?.workspaceFsFor(ctx.agentId) : undefined
+        if (pod && !placement) return { ok: false, reason: 'sandboxed' }
+        const target: SaveAttachmentTarget = placement
+          ? { kind: 'workspace-fs', fs: placement.fs, root: location.root }
+          : process.platform === 'linux'
+            ? { kind: 'pinned', root: location.root }
+            : { kind: 'workspace-fs', fs: localWorkspaceFs, root: location.root, canonicalDir: canonicalWorkspacePath }
+        try {
+          return await saveAttachmentTo(target, name, bytes)
+        } catch (err) {
+          if (pod) return { ok: false, reason: 'sandboxed' }
+          return { ok: false, reason: 'write-failed', detail: err instanceof Error ? err.message : String(err) }
+        }
       },
       chargeShareBudget: (ctx, bytes) => {
         const key = sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
