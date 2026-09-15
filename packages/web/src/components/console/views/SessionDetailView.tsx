@@ -110,6 +110,7 @@ import {
   appStepKey,
   liveAppKeys,
   mcpAppCard,
+  mergeFetchedAppCard,
   APP_LANE,
   ELICIT_LANE,
   elicitStepKey,
@@ -1814,7 +1815,7 @@ function McpAppRow({
   onRpc?: McpAppCardProps['onRpc']
   onClose?: McpAppCardProps['onClose']
 }) {
-  const [html, setHtml] = useState<{ appId: string; html: string } | null>(null)
+  const [full, setFull] = useState<NonNullable<FmtStep['app']> | null>(null)
   const app = step.app
   const appId = app?.appId
   const toolCallId = step.msg?.toolCallId
@@ -1825,19 +1826,22 @@ function McpAppRow({
     fetchToolBody(sessionId!, toolCallId!).then(
       (body) => {
         const card = mcpAppCard(body)
-        if (live && card?.html) setHtml({ appId: appId!, html: card.html })
+        if (live && card?.appId === appId) setFull(card)
       },
       () => {
-        // A template that cannot be fetched leaves the card as the record it already is.
+        // A card that cannot be fetched stays the preview it already is.
       }
     )
     return () => {
       live = false
     }
   }, [wants, sessionId, toolCallId, appId])
-  const withTemplate =
-    app && html?.appId === app.appId && !app.html ? { ...step, app: { ...app, html: html.html } } : step
-  return <McpAppCard step={withTemplate} {...(onRpc ? { onRpc } : {})} {...(onClose ? { onClose } : {})} />
+  // The fetch supplies what the ROW shed; the row itself stays authoritative for everything it
+  // still carries. `outcome` is why that distinction matters: the fetched copy is a snapshot from
+  // whenever it was read, so letting it win would put a card the reader has since closed back on
+  // screen, frame and all, until the next reload.
+  const whole = app && full?.appId === app.appId && !app.html ? { ...step, app: mergeFetchedAppCard(app, full) } : step
+  return <McpAppCard step={whole} {...(onRpc ? { onRpc } : {})} {...(onClose ? { onClose } : {})} />
 }
 
 // The expandable body panel for one tool row: input, output, content blocks,
