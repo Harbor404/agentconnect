@@ -2701,6 +2701,9 @@ export const CreateWebhookHookBody = HookBodyBase.extend({
 export const GithubHookFamily = z.enum(['pull_request', 'issues', 'push', 'deployment'])
 export const GitlabHookFamily = z.enum(['merge_request', 'issues', 'push'])
 
+/** Label names the subject's CURRENT labels must intersect (case-insensitively, at the relay); empty = any label. */
+export const HookLabelFilter = z.array(z.string().trim().min(1).max(100)).max(20)
+
 export const CreateGithubHookBody = HookBodyBase.extend({
   kind: z.literal('github'),
   family: GithubHookFamily,
@@ -2718,7 +2721,7 @@ export const CreateGithubHookBody = HookBodyBase.extend({
   // GitHub emits one issue_comment family for both issue and PR conversations,
   // so a row carrying such a subscription must scope it to its own family.
   commentFamilies: GithubCommentFamilies.default([]),
-  labelFilter: z.array(z.string().trim().min(1).max(100)).max(20).default([]),
+  labelFilter: HookLabelFilter.default([]),
   // P3 summon mode: every event's authored text must @-mention the assigned
   // agent or the App (thread actors also pass the relay's live maintainer gate).
   mentionOnly: z.boolean().default(false),
@@ -2741,6 +2744,7 @@ export const CreateGitlabHookBody = HookBodyBase.extend({
   events: z.array(z.string().regex(GitlabHookEventPattern)).min(1).max(20),
   // Note events for this row's own subject family (§12); empty = no comments.
   commentFamilies: z.array(GitlabCommentFamily).max(2).default([]),
+  labelFilter: HookLabelFilter.default([]),
   mentionOnly: z.boolean().default(false),
   // The two effect axes github carries; `check` is the §16 run note. No gateMode — GitLab has no required gate.
   reviewPolicy: HookReviewPolicyEnum.default('off'),
@@ -2755,6 +2759,7 @@ export const CreateGiteaHookBody = HookBodyBase.extend({
   family: GitlabHookFamily,
   events: z.array(z.string().regex(GitlabHookEventPattern)).min(1).max(20),
   commentFamilies: z.array(GitlabCommentFamily).max(2).default([]),
+  labelFilter: HookLabelFilter.default([]),
   mentionOnly: z.boolean().default(false),
   // `status` is the Control-Plane-written commit status (§10.4); no gateMode — a required check is the operator's choice.
   reviewPolicy: HookReviewPolicyEnum.default('off'),
@@ -2783,6 +2788,8 @@ export const UpdateHookBody = z.union([
   CreateGitlabHookBody.omit({ family: true }).extend({
     enabled: z.boolean().optional(),
     commentFamilies: z.array(GitlabCommentFamily).max(2).optional(),
+    // Optional on PUT: a client predating the filter echoes the row without it and must not clear a stored one.
+    labelFilter: HookLabelFilter.optional(),
     mentionOnly: z.boolean().optional(),
     // Optional on whole-definition PUT so a client predating these axes preserves the stored policy.
     reviewPolicy: HookReviewPolicyEnum.optional(),
@@ -2791,6 +2798,7 @@ export const UpdateHookBody = z.union([
   CreateGiteaHookBody.omit({ family: true }).extend({
     enabled: z.boolean().optional(),
     commentFamilies: z.array(GitlabCommentFamily).max(2).optional(),
+    labelFilter: HookLabelFilter.optional(),
     mentionOnly: z.boolean().optional(),
     reviewPolicy: HookReviewPolicyEnum.optional(),
     reportingMode: HookReportingModeEnum.optional()
