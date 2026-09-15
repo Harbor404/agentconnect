@@ -4874,6 +4874,7 @@ export interface SkillSourceDto {
   ref: string | null // branch/tag/commit
   subDir: string | null
   skills: string[] // the source's own skill filter ([] ⇒ install all)
+  private: boolean // private repo — acquired through the org GitHub App's read-only token
   visibility: ResourceVisibility
   sharedWith: string[]
   createdBy: string | null
@@ -4990,6 +4991,7 @@ export interface AgentSkillSourceDto {
   ref: string | null
   subDir: string | null
   skills: string[]
+  private: boolean
 }
 export async function fetchAgentSkillSources(agentId: string): Promise<AgentSkillSourceDto[]> {
   return apiGet<AgentSkillSourceDto[]>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/skill-sources`)

@@ -14,7 +14,11 @@ import {
   resolveBoundedGitSkillSource,
   type GitSkillCredentialRequest
 } from '../src/skills/skill-git-source.js'
-import { daemonGitCredentialTarget, initGitInjection } from '../src/workspace/git-injection.js'
+import {
+  daemonGitCredentialTarget,
+  initGitInjection,
+  sandboxGitCredentialTarget
+} from '../src/workspace/git-injection.js'
 import { configureWorkspaceGitOrigins } from '../src/workspace/git-origin-policy.js'
 
 const entry = (source: string, githubRepoId = '42') => ({
@@ -639,17 +643,21 @@ describe('Git skill source policy boundary', () => {
     }
   })
 
-  it('uses a scoped identity lookup without enabling a private skill source', async () => {
+  it('acquires a private skill source through the scoped credential after the anonymous identity read misses', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ac-skill-git-auth-'))
     const archive = tarGzip([{ path: `skills-${SHA}/SKILL.md`, body: 'private' }])
+    // Anonymously a private repository reads as 404; every later API read must
+    // then carry the credential, while codeload never sees the installation token.
     const offline = offlineGitHubFetch({
       archive,
+      requireAuth: true,
       identities: [{ status: 404 }, { private: true }]
     })
     const credentialRequests: GitSkillCredentialRequest[] = []
     try {
-      await expect(
-        acquireGitSkillSource(entry('acme/skills'), {
+      const result = await acquireGitSkillSource(
+        { ...entry('acme/skills'), private: true },
+        {
           destination: join(root, 'acquired'),
           agentId: 'agent-1',
           useGitCredential: true,
@@ -658,8 +666,10 @@ describe('Git skill source policy boundary', () => {
             credentialRequests.push(request)
             return { username: 'x-access-token', password: 'private-token' }
           }
-        })
-      ).rejects.toThrow(/private skill sources are not supported/i)
+        }
+      )
+      expect(result.resolvedCommit).toBe(SHA)
+      expect(await readFile(join(result.sourceDir, 'SKILL.md'), 'utf8')).toBe('private')
 
       expect(credentialRequests).toHaveLength(1)
       expect(credentialRequests[0]).toMatchObject({
@@ -667,11 +677,44 @@ describe('Git skill source policy boundary', () => {
         cloneUrl: 'https://github.com/acme/skills.git',
         repositoryPath: 'acme/skills'
       })
-      expect(offline.calls.map((call) => call.authorization)).toEqual([null, 'Bearer private-token'])
-      expect(offline.calls.map((call) => call.url)).toEqual([
-        'https://api.github.com/repositories/42',
-        'https://api.github.com/repositories/42'
-      ])
+      const [first, ...rest] = offline.calls
+      expect(first).toMatchObject({ url: 'https://api.github.com/repositories/42', authorization: null })
+      expect(
+        rest.filter((call) => call.url.startsWith('https://api.github.com/')).map((call) => call.authorization)
+      ).toEqual(expect.arrayContaining(['Bearer private-token']))
+      expect(
+        rest
+          .filter((call) => call.url.startsWith('https://api.github.com/'))
+          .every((call) => call.authorization === 'Bearer private-token')
+      ).toBe(true)
+      expect(
+        offline.calls
+          .filter((call) => call.url.startsWith('https://codeload.github.com/'))
+          .map((call) => call.authorization)
+      ).toEqual([null])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not ask for a credential when the source is public and the workspace grants none', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ac-skill-git-anon-'))
+    const offline = offlineGitHubFetch({
+      archive: tarGzip([{ path: `skills-${SHA}/SKILL.md`, body: 'public' }])
+    })
+    try {
+      await expect(
+        acquireGitSkillSource(entry('acme/skills'), {
+          destination: join(root, 'acquired'),
+          agentId: 'agent-1',
+          useGitCredential: false,
+          fetch: offline.fetch,
+          credentialProvider: async () => {
+            throw new Error('must not be consulted')
+          }
+        })
+      ).resolves.toMatchObject({ resolvedCommit: SHA })
+      expect(offline.calls.every((call) => call.authorization === null)).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -711,8 +754,7 @@ describe('Git skill source policy boundary', () => {
 
   it.each([
     ['numeric id', [{ id: '43' }]],
-    ['canonical name', [{ fullName: 'attacker/skills' }]],
-    ['public visibility', [{ private: true }]]
+    ['canonical name', [{ fullName: 'attacker/skills' }]]
   ])('rejects a mismatched %s before any name-based GitHub request', async (_label, identities) => {
     const root = await mkdtemp(join(tmpdir(), 'ac-skill-git-identity-mismatch-'))
     const offline = offlineGitHubFetch({
@@ -727,7 +769,7 @@ describe('Git skill source policy boundary', () => {
           useGitCredential: false,
           fetch: offline.fetch
         })
-      ).rejects.toThrow(/identity does not match|private skill sources are not supported/i)
+      ).rejects.toThrow(/identity does not match/i)
       expect(offline.calls.map((call) => call.url)).toEqual(['https://api.github.com/repositories/42'])
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -805,6 +847,32 @@ describe('Git skill source policy boundary', () => {
     expect(cloneUrl).toBe('ssh://git@git.example.test:2222/acme/skills.git')
     expect(env.AC_GITCRED_AGENT).toBeUndefined()
     expect(env.AC_GITCRED_CAPABILITY).toBeUndefined()
+  })
+
+  it('points a cluster agent’s acquisition at the DAEMON helper, not the sandbox pod’s', () => {
+    // A cluster agent's workspace git runs in its sandbox, so `targetFor` names the pod's helper
+    // and tunnel socket. Skill acquisition runs on the daemon, where neither exists — using them
+    // is exactly the "skill GitHub credentials are unavailable" failure on every private source.
+    const daemon = daemonGitCredentialTarget({ shimPath: '/daemon/git-credential-helper', runDir: '/private/run' })
+    initGitInjection({
+      targetFor: () => sandboxGitCredentialTarget(),
+      daemonTarget: daemon,
+      preWarm: async () => {},
+      capabilityFor: (agentId) => `cap-${agentId}`
+    })
+    const env = buildSkillGitAcquisitionEnv({
+      agentId: 'agent-1',
+      cloneUrl: 'https://github.com/acme/skills.git',
+      privateHome: '/private/home',
+      useGitCredential: true
+    })
+    const config = gitConfig(env)
+
+    expect(env.AC_GITCRED_AGENT).toBe('agent-1')
+    expect(env.AC_GITCRED_CAPABILITY).toBe('cap-agent-1')
+    expect(env.AC_GITCRED_SOCKET).toBeUndefined() // the daemon shim derives its own socket
+    expect(config.get('credential.https://github.com.helper')).toBe("!'/daemon/git-credential-helper' agent-1")
+    expect(config.get('credential.https://github.com.helper')).not.toContain('/opt/agentconnect/bin')
   })
 
   it('scopes the daemon credential capability to canonical GitHub HTTPS only', () => {

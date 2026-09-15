@@ -190,6 +190,83 @@ describe('GitCredServer routing (gitcred.sock)', () => {
     ])
   })
 
+  it('routes a private GitHub skill source to GitHub even when the workspace credential is gitlab', async () => {
+    // Skill acquisition is daemon-owned and asks under the implicit (GitHub) provider. Without the
+    // spec-derived skill authority the ask would inherit the WORKSPACE provider and reach the gitlab
+    // broker, so a gitlab/gitea-workspace agent could never install a private GitHub skill source.
+    const { sockPath, gets, capability } = await boot('example-group/example-project', {
+      providerOf: () => 'gitlab',
+      qualifiedRepoOf: () => undefined,
+      privateGithubSkillRepoOf: (_agentId: string, repoFullName: string) =>
+        repoFullName.toLowerCase() === 'qargotms/claude-plugins'
+    })
+    const res = await roundtrip(sockPath, {
+      op: 'get',
+      agentId: 'a1',
+      capability,
+      repoFullName: 'QargoTMS/claude-plugins'
+    })
+    expect(res.ok).toBe(true)
+    expect(gets).toEqual([{ agentId: 'a1', opts: { plane: 'git', repo: 'QargoTMS/claude-plugins' } }])
+
+    // An unrelated repository still follows the workspace provider.
+    const other = await roundtrip(sockPath, {
+      op: 'get',
+      agentId: 'a1',
+      capability,
+      repoFullName: 'example-group/other'
+    })
+    expect(other.ok).toBe(true)
+    expect(gets[1]).toEqual({ agentId: 'a1', opts: { plane: 'git', repo: 'example-group/other', provider: 'gitlab' } })
+  })
+
+  it('does not fold a private GitHub skill source onto a gitlab workspace that shares its path', async () => {
+    // A gitlab workspace `acme/tools` and a private GitHub source `acme/tools` (a mirror) are two
+    // repositories on two hosts. Folding by path alone would classify the GitHub acquisition ask as
+    // the workspace ask and return the gitlab credential to the GitHub helper.
+    const { sockPath, gets, erases, capability } = await boot('acme/tools', {
+      providerOf: () => 'gitlab',
+      workspaceRepoIdOf: () => '4455668',
+      privateGithubSkillRepoOf: (_agentId: string, repoFullName: string) => repoFullName.toLowerCase() === 'acme/tools'
+    })
+    const res = await roundtrip(sockPath, { op: 'get', agentId: 'a1', capability, repoFullName: 'acme/tools' })
+    expect(res.ok).toBe(true)
+    expect(gets).toEqual([{ agentId: 'a1', opts: { plane: 'git', repo: 'acme/tools' } }])
+
+    // The gitlab helper's own ask for the workspace still folds onto the repo-less workspace key.
+    const ws = await roundtrip(sockPath, {
+      op: 'get',
+      agentId: 'a1',
+      capability,
+      repoFullName: 'acme/tools',
+      provider: 'gitlab'
+    })
+    expect(ws.ok).toBe(true)
+    expect(gets[1]).toEqual({ agentId: 'a1', opts: { plane: 'git', provider: 'gitlab', externalRepoId: '4455668' } })
+
+    // Erase from the GitHub helper reaches the key the GitHub get used, not the workspace's.
+    await roundtrip(sockPath, { op: 'erase', agentId: 'a1', capability, repoFullName: 'acme/tools', password: 'x' })
+    expect(erases).toEqual([{ agentId: 'a1', password: 'x', opts: { plane: 'git', repo: 'acme/tools' } }])
+  })
+
+  it('does not let a skill repository answer an explicit gitlab host hint', async () => {
+    const { sockPath, gets, capability } = await boot(undefined, {
+      providerOf: () => 'gitlab',
+      privateGithubSkillRepoOf: () => true
+    })
+    const res = await roundtrip(sockPath, {
+      op: 'get',
+      agentId: 'a1',
+      capability,
+      repoFullName: 'QargoTMS/claude-plugins',
+      provider: 'gitlab'
+    })
+    expect(res.ok).toBe(true)
+    expect(gets).toEqual([
+      { agentId: 'a1', opts: { plane: 'git', repo: 'QargoTMS/claude-plugins', provider: 'gitlab' } }
+    ])
+  })
+
   it('denies a gitlab project the replicated spec does not authorize', async () => {
     const { sockPath, gets, capability } = await boot(undefined, {
       providerOf: () => 'github',
