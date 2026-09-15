@@ -86,7 +86,12 @@ async function render(channelKey = 'one', canEdit = true, onOpenLegacy?: () => P
   await act(async () =>
     root.render(
       <UnifiedMemoryPanel agentId="agent" channelKey={channelKey} canEdit={canEdit} {...{ onOpenLegacy }}>
-        <div>Legacy memory tools</div>
+        {(viewSwitch) => (
+          <div>
+            {viewSwitch}
+            <span>Legacy memory tools</span>
+          </div>
+        )}
       </UnifiedMemoryPanel>
     )
   )
@@ -217,7 +222,7 @@ it('refreshes retained tools when switching from a successful entry create', asy
   await render('one', true, refresh)
   await click('New memory')
   await click('Save memory')
-  await click('More memory tools')
+  await click('Files')
   expect(refresh).toHaveBeenCalledTimes(1)
   expect(host.textContent).toContain('Legacy memory tools')
 })
@@ -312,4 +317,39 @@ it('offers history only when advertised and pages the entry change log by ref', 
   expect(host.textContent).not.toContain('Load older changes')
   await click('Hide history')
   expect(host.textContent).not.toContain('Updated')
+})
+
+it('ignores a click on the already-active view and recovers paging after a refresh', async () => {
+  const refresh = vi.fn(async () => {})
+  await render('one', true, refresh)
+  await click('Entries')
+  expect(refresh).not.toHaveBeenCalled()
+  expect(api.describeAgentMemoryEntries).toHaveBeenCalledTimes(1)
+  await click('Files')
+  expect(refresh).toHaveBeenCalledTimes(1)
+  await click('Files')
+  expect(refresh).toHaveBeenCalledTimes(1)
+  await click('Entries')
+  let resolvePage!: (value: Awaited<ReturnType<typeof api.listAgentMemoryEntries>>) => void
+  vi.mocked(api.listAgentMemoryEntries)
+    .mockResolvedValueOnce({ entries: [entry], consistency: 'live', order: 'topic', nextCursor: 'next' })
+    .mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          resolvePage = r
+        })
+    )
+  await click('Refresh')
+  await click('Load more')
+  expect([...host.querySelectorAll('button')].find((b) => b.textContent === 'Loading…')).toBeTruthy()
+  vi.mocked(api.listAgentMemoryEntries).mockResolvedValueOnce({
+    entries: [entry],
+    consistency: 'live',
+    order: 'topic',
+    nextCursor: 'again'
+  })
+  await click('Refresh')
+  await act(async () => resolvePage({ entries: [], consistency: 'live', order: 'topic' }))
+  const more = [...host.querySelectorAll('button')].find((b) => b.textContent === 'Load more')
+  expect(more?.disabled).toBe(false)
 })
