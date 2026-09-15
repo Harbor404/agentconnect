@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  appStepKey,
   foldCustomAnswers,
+  liveAppKeys,
+  mcpAppCard,
   PLAN_LANE,
   WORK_LANES,
   planEntries,
@@ -251,5 +254,63 @@ describe('foldCustomAnswers', () => {
     expect(only[0]?.options.map((o) => o.label)).toEqual(['Other'])
     const seeded = foldCustomAnswers([{ ...q('q', 'enum', ['keep', 'Other']), defaultValue: 'Other' }, box('q_custom')])
     expect(seeded[0]?.defaultValue).toBeUndefined()
+  })
+})
+
+describe('mcpAppCard — reading an app row back (webchat-mcp-apps.md §8)', () => {
+  const RECORDED = {
+    appId: 'app-1',
+    title: 'Token balances',
+    toolName: 'charts__balances',
+    html: '<p>chart</p>',
+    toolInput: { chain: 'eth' },
+    toolResult: { structuredContent: { total: 1 } },
+    dimensions: { height: 420 },
+    outcome: 'expired'
+  }
+
+  it('carries the recorded TEMPLATE through, which is what re-renders the page on a reload', () => {
+    expect(mcpAppCard(JSON.stringify(RECORDED))).toEqual(RECORDED)
+  })
+
+  it('reads a row whose template was stripped for the page as a card still worth showing', () => {
+    // The transcript page drops `html` on an oversized row; the card parses without it and the
+    // console fetches the whole body under the row's own key.
+    const { html: _stripped, ...lean } = RECORDED
+    expect(mcpAppCard(JSON.stringify(lean))).toEqual(lean)
+  })
+
+  it('drops an outcome it cannot read rather than rendering a verdict it invented', () => {
+    expect(mcpAppCard(JSON.stringify({ ...RECORDED, outcome: 'vaporized' }))?.outcome).toBeUndefined()
+  })
+
+  it('refuses a body that is not a card at all', () => {
+    expect(mcpAppCard(undefined)).toBeNull()
+    expect(mcpAppCard('not json')).toBeNull()
+    expect(mcpAppCard(JSON.stringify({ title: 'no id' }))).toBeNull()
+  })
+})
+
+describe('liveAppKeys — one card, not two, while its live copy stands', () => {
+  it('keys a live app step by its owner and card id, so the persisted row can step aside', () => {
+    const live = [
+      { lane: 'APP', agentId: 'bot-a', app: { appId: 'app-1' } },
+      { lane: 'APP', app: { appId: 'app-2' } },
+      { lane: 'TOOL' }
+    ]
+    const keys = liveAppKeys(live, 'owner')
+    expect(keys.has(appStepKey('bot-a', 'app-1'))).toBe(true)
+    // A step with no agent of its own belongs to the conversation's owner.
+    expect(keys.has(appStepKey('owner', 'app-2'))).toBe(true)
+    expect(keys.size).toBe(2)
+  })
+
+  it('is empty when nothing is streaming, which leaves the persisted card alone', () => {
+    expect(liveAppKeys([], 'owner').size).toBe(0)
+    expect(liveAppKeys([{ lane: 'TOOL' }], 'owner').size).toBe(0)
+  })
+
+  it('does not collide two owners holding the same card id', () => {
+    expect(appStepKey('bot-a', 'app-1')).not.toBe(appStepKey('bot-b', 'app-1'))
   })
 })
