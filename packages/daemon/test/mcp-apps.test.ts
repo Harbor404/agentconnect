@@ -474,6 +474,10 @@ describe('reviveAppRow — rebuilding a card from what the daemon recorded (§8)
     })
   })
 
+  it('refuses a completed interface so another tab cannot repeat its workflow', () => {
+    expect(reviveAppRow('app-1', 'conv-1', stored({ ...RECORDED, outcome: 'completed' }))).toBeUndefined()
+  })
+
   it('refuses a row whose card id is not the one being revived, and one that will not parse', () => {
     expect(reviveAppRow('app-2', 'conv-1', stored(RECORDED))).toBeUndefined()
     expect(reviveAppRow('app-1', 'conv-1', { ...stored(RECORDED), body: 'not json' })).toBeUndefined()

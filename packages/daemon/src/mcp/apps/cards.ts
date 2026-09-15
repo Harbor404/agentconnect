@@ -37,6 +37,8 @@ export interface LiveApp {
    *  a `tools/call` naming anything else is refused, which is what keeps one app's frame from
    *  driving another server's tools. */
   readonly server: string
+  // Built-in administration uses a conversation-owned connection instead of an organization provider.
+  readonly admin?: true
   /** The organization the card's server was resolved in. Held because a server NAME alone does not
    *  identify a connection: a CP-pushed definition is org-scoped, so two organizations may each
    *  have a `charts` pointing at different proxies under different grants. Without this a view's
@@ -106,7 +108,7 @@ export function reviveAppRow(
   if (!parsed.success) return undefined
   const body = parsed.data
   if (body.appId !== appId || !body.server || body.conversationId !== conversationId) return undefined
-  if (body.outcome === 'closed') return undefined
+  if (body.outcome === 'closed' || body.outcome === 'completed') return undefined
   return {
     channel: stored.channel,
     thread: stored.thread,

@@ -166,7 +166,7 @@ import { TranscriptRecorder, type TranscriptEvent } from './session/transcript-r
 import { TerminalOutputFolder } from './session/terminal-output-folder.js'
 import { attachmentMention, sniffImageMimeType } from './session/attachment-block.js'
 import { McpControlServer } from './mcp/control-server.js'
-import { RemoteWebchatGrantManager } from './mcp/remote-webchat-grant.js'
+import { ADMIN_MCP_SERVER_NAME, RemoteWebchatGrantManager } from './mcp/remote-webchat-grant.js'
 import type { CodeHostEffectReq, SessionContext } from './mcp/ops.js'
 import type { MemoryAccessDecision, MemoryWriteAsk, MemoryWriteVerdict } from './mcp/ops/memory.js'
 import { GitCredentialCache } from './cp/git-credential.js'
@@ -3344,7 +3344,15 @@ export class Daemon {
         // see `_meta.ui` on the way back. `resolveAgentMcpServers` below skips the same servers,
         // so each of their tools has exactly one call path. Read from connections already up: a
         // server still dialing contributes to the next session rather than delaying this one.
-        tools.push(...this.appsHost.cachedToolsFor(this.orgForAgent(agent.id), agent.mcpServers))
+        const enabledApps =
+          agent.builtin && platform === 'webchat'
+            ? agent.mcpServers.filter((name) => name !== ADMIN_MCP_SERVER_NAME)
+            : agent.mcpServers
+        tools.push(...this.appsHost.cachedToolsFor(this.orgForAgent(agent.id), enabledApps))
+        if (agent.builtin && platform === 'webchat') {
+          const adminApps = this.remoteWebchatGrants?.appsFor(channel, agent.id)
+          tools.push(...(adminApps?.cachedToolsFor(undefined, [ADMIN_MCP_SERVER_NAME]) ?? []))
+        }
         // Bind the bridge token to the exact integration that delivered this turn.
         // Falling back to agent.integrations[0] can send a title/message through the
         // wrong bot when one agent has multiple integrations. A memory-only session
@@ -12004,14 +12012,10 @@ export class Daemon {
       // A prior provider post-turn operation is serialized. Managed needs this
       // barrier before reading its index; external recordTurn only durably enqueues.
       await (this.memoryPostTurnChains.get(agentId) ?? Promise.resolve())
-      // Remote administration uses only the standard ACP HTTPS MCP descriptor.
-      // Authorization and write-operation idempotency are both CP-owned. The
-      // runtime is already arbitrary executable code inside its configured
-      // process boundary, so artifact/provenance/version/probe gates do not add
-      // an enforceable security boundary. For a CP-authorized preset turn, try
-      // the standard ACP descriptor regardless of runtime or sandbox mode.
+      // Host admin tools under the conversation grant; fall back to the runtime descriptor if hosting is unavailable.
       if (agent.builtin && webchat?.remoteMcp && this.remoteWebchatGrants) {
         try {
+          const previouslyHosted = !!this.remoteWebchatGrants.appsFor(webchat.conversationId, agentId)
           const provisioned = await this.remoteWebchatGrants.provision(
             webchat.conversationId,
             webchat.remoteMcp,
@@ -12019,7 +12023,13 @@ export class Daemon {
             agentId
           )
           remoteMcpServer = provisioned.server
-          if (provisioned.changed) {
+          const hosted =
+            this.mcpToolServerReachable() &&
+            (await this.remoteWebchatGrants.prepareApps(webchat.conversationId, agentId))
+          if (hosted) {
+            remoteMcpServer = undefined
+          }
+          if (provisioned.changed || previouslyHosted !== hosted) {
             const existing = await this.store.getSession(key)
             // selectedHost is assigned only after handle() for ordinary warm
             // turns. Resolve the already-running agent host directly here so the
@@ -14225,8 +14235,16 @@ export class Daemon {
   ): Promise<{ result: unknown } | undefined> {
     const split = splitAppToolName(name)
     const orgId = this.orgForAgent(ctx.agentId)
-    if (!split || !this.appsHost.isUiServer(orgId, split.server)) return undefined
-    const call = await this.appsHost.call(orgId, split.server, split.tool, args)
+    if (!split) return undefined
+    const admin =
+      split.server === ADMIN_MCP_SERVER_NAME &&
+      ctx.platform === 'webchat' &&
+      this.agents.get(ctx.agentId)?.builtin === true
+    const host = admin ? this.remoteWebchatGrants?.appsFor(ctx.channel, ctx.agentId) : this.appsHost
+    const scope = admin ? undefined : orgId
+    if (admin && !host) throw new Error('This administration interface is no longer active')
+    if (!host?.isUiServer(scope, split.server)) return undefined
+    const call = await host.call(scope, split.server, split.tool, args)
     if (!call.card) {
       // A tool that declared an interface we could not produce is DECLINED out loud, on whatever
       // surface this turn has (webchat-mcp-apps.md §6/§7.4): the reader was going to be shown
@@ -14246,14 +14264,15 @@ export class Daemon {
     // A template that fits the card's own frame rides it; a real app's does not, and is sent as
     // ordered chunks straight after the card (webchat-mcp-apps.md §5). The threshold is the CARD
     // budget, so the decision is made against the thing that actually has to encode.
-    const inline = Buffer.byteLength(call.card.html, 'utf8') <= MCP_APP_INLINE_TEMPLATE_MAX_BYTES
+    const html = call.card.html ?? ''
+    const inline = Buffer.byteLength(html, 'utf8') <= MCP_APP_INLINE_TEMPLATE_MAX_BYTES
     const posted = this.appSurface.open(
       key,
       {
         appId,
         title: call.title,
         toolName: name,
-        ...(inline ? { html: call.card.html } : { htmlBytes: call.card.html.length }),
+        ...(call.card.nativeUi ? { nativeUi: call.card.nativeUi } : inline ? { html } : { htmlBytes: html.length }),
         ...(Object.keys(args).length > 0 ? { toolInput: args } : {}),
         toolResult: call.card.toolResult,
         ...(call.card.csp ? { csp: call.card.csp } : {}),
@@ -14295,6 +14314,7 @@ export class Daemon {
         agentId: ctx.agentId,
         sessionKey: key,
         server: split.server,
+        ...(admin ? { admin: true } : {}),
         ...(orgId ? { orgId } : {}),
         toolName: name,
         openedAt: Date.now(),
@@ -14368,6 +14388,12 @@ export class Daemon {
     const answer = (outcome: McpAppRpcResult): void =>
       this.appSurface.answer(reply ?? app.stream, appId, callId, outcome)
     try {
+      const host = app.admin ? this.remoteWebchatGrants?.appsFor(conversationId, app.agentId ?? '') : this.appsHost
+      const scope = app.admin ? undefined : app.orgId
+      if (!host) {
+        answer({ ok: false, error: APP_RPC_REFUSALS.unknown })
+        return
+      }
       switch (rpc.method) {
         case 'tools/call': {
           // Charged before the call, so a frame in a loop is stopped by the budget rather than by
@@ -14379,12 +14405,12 @@ export class Daemon {
           // The SERVER is the card's, always; the name is resolved against that server's own tool
           // list. A view calls its tool by the name its server gave it (`refresh`) and has no
           // business knowing the `<server>__<tool>` namespace an operator's config produced.
-          const tool = await this.appsHost.resolveViewTool(app.orgId, app.server, rpc.name)
+          const tool = await host.resolveViewTool(scope, app.server, rpc.name)
           if (tool === undefined) {
             answer({ ok: false, error: APP_RPC_REFUSALS.unknown_tool })
             return
           }
-          const call = await this.appsHost.callForView(app.orgId, app.server, tool, rpc.args ?? {})
+          const call = await host.callForView(scope, app.server, tool, rpc.args ?? {})
           // The RAW upstream result, structured content included: that payload is what the view
           // asked for and what it has to render, and the model's half of it would be no use here.
           answer({
@@ -14398,7 +14424,7 @@ export class Daemon {
           return
         }
         case 'resources/read':
-          answer({ ok: true, result: await this.appsHost.readResource(app.orgId, app.server, rpc.uri) })
+          answer({ ok: true, result: await host.readResource(scope, app.server, rpc.uri) })
           return
         case 'ui/message': {
           // The frame speaking into the conversation. It becomes the READER's turn, under the
@@ -14421,6 +14447,25 @@ export class Daemon {
               ? { ok: true, result: { turnId: ack.turnId } }
               : { ok: false, error: ack.reason ?? 'the message was not accepted' }
           )
+          if (ack.accepted && app.admin && app.toolName === `${ADMIN_MCP_SERVER_NAME}__configureIntegration`) {
+            const settled = this.liveApps.settle(appId)
+            if (settled)
+              this.settleAppCard(
+                {
+                  ...settled,
+                  ...(settled.row
+                    ? {
+                        row: {
+                          ...settled.row,
+                          title: 'Integration configured',
+                          toolResult: { content: [{ type: 'text', text: rpc.text }] }
+                        }
+                      }
+                    : {})
+                },
+                'completed'
+              )
+          }
           return
         }
         case 'ui/update-model-context':
@@ -14454,7 +14499,7 @@ export class Daemon {
       return undefined
     }
     const row = stored ? reviveAppRow(appId, conversationId, stored) : undefined
-    if (!row) return undefined
+    if (!row || row.server === ADMIN_MCP_SERVER_NAME) return undefined
     const orgId = this.orgForAgent(row.sender)
     const app: LiveApp = {
       appId,
