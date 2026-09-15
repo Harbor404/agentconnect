@@ -31,6 +31,10 @@ import type {
   DutyGroupRepo,
   McpProviderSecretStore,
   McpGrantRepo,
+  McpProviderRecord,
+  McpProviderOauthRepo,
+  McpProviderOauthSecretStore,
+  McpProviderOauthStateStore,
   SkillSourceRepo,
   OrganizationEnvironmentRepo,
   OrganizationEnvironmentResolver,
@@ -64,6 +68,9 @@ import type {
 import type { Clock } from '../domain/clock.js'
 import type { OAuthService } from '../registry/oauthService.js'
 import type { GithubService } from '../github/service.js'
+import type { McpProviderOauthService } from '../mcp-oauth/service.js'
+import type { McpTokenResolver } from '../orchestrator/mcpUpstreamHeaders.js'
+import type { OrgId } from '../domain/ids.js'
 import type { GitlabOauthService } from '../gitlab/oauth.service.js'
 import type { GitlabApiClient } from '../gitlab/api.js'
 import type { GitlabAccountService } from '../gitlab/account.service.js'
@@ -212,6 +219,13 @@ export interface HttpDeps {
     mcpProviderSecret: McpProviderSecretStore
     /** Plaintext bearer grant keys for MCP providers (store-only, echoed once on create). */
     mcpGrant: McpGrantRepo
+    /** The CP's OAuth grant per `auth: 'oauth2'` provider — non-secret state, the refresh
+     *  lease, and every transaction that writes a sealed pair atomically with its version. */
+    mcpProviderOauth: McpProviderOauthRepo
+    /** The ONLY read path for an OAuth provider's sealed client secret and token pair. */
+    mcpProviderOauthSecret: McpProviderOauthSecretStore
+    /** One-shot start → begin → callback rows (sealed PKCE verifier, recorded issuer). */
+    mcpProviderOauthState: McpProviderOauthStateStore
     /** Org-level shared-skills sources (metadata only; content stays daemon-side). */
     skillSource: SkillSourceRepo
     /** Accepted organization Knowledge, managed-skill revisions, and pending suggestion metadata. */
@@ -414,6 +428,14 @@ export interface HttpDeps {
   /** github-app workspaces façade; absent ⇒ feature disabled (GITHUB_APP_* unset) and
    *  every github route 404s. */
   github?: GithubService
+  /** The MCP-provider authorization funnel (mcp-provider-oauth.md); absent ⇒ routes 404. */
+  mcpProviderOauth?: McpProviderOauthService
+  /** Token custody, so EVERY live publication resolves an oauth2 provider's header the same
+   *  way — a rotation or a PATCH that reads the static header set would overwrite a working
+   *  OAuth binding with no Authorization at all. */
+  mcpTokenResolver?: McpTokenResolver
+  /** Stop projecting a disconnected grant into the relay pool. Joins the provider chain. */
+  mcpOauthUnbind?: (orgId: OrgId, provider: McpProviderRecord) => Promise<void>
   /** GitLab OAuth surface (gitlab-com-integration.md §9); absent ⇒ routes 404.
    *  `api` is the base-bound GitLab edge the admin routes share with the service. */
   gitlab?: {

@@ -9,6 +9,7 @@ const provider: McpProviderRecord = {
   orgId: 'org-1' as OrgId,
   name: 'linear',
   kind: 'custom',
+  auth: 'headers',
   transport: 'http',
   ui: false,
   url: 'https://mcp.linear.app/sse',
@@ -170,7 +171,7 @@ describe('rotateProviderGrant', () => {
         active.delete(id)
       }
     }
-    const pushAssign = async (_p: McpProviderRecord, _h: McpHeader[], grant: GrantView, _org: OrgId) => {
+    const pushAssign = async (_p: McpProviderRecord, _h: McpHeader[] | null, grant: GrantView, _org: OrgId) => {
       await yieldTick()
       published = grant.key
     }
