@@ -32,7 +32,8 @@ import {
   type ClusterSkillPrior,
   type ClusterSkillPriorReply,
   type ClusterSkillReceipt,
-  type ClusterSkillReceiptPage
+  type ClusterSkillReceiptPage,
+  type ClusterSkillSkippedSource
 } from './skill-protocol.js'
 
 interface Operation {
@@ -287,19 +288,25 @@ export class ClusterSkillHandler {
       throw new Error('reconcile source was not declared')
     }
     const sourceMeta = new Map(input.sources.map((source) => [source.sourceId, source]))
+    // A prior root preserved for a skipped source may carry an earlier revision's source id (a Git
+    // source id names its commit), so its kind comes from the prior receipt, not this run's sources.
+    const priorKinds = new Map(input.priorRoots.map((root) => [`${root.path}\0${root.sourceId}`, root.sourceKind]))
     const ownedRoot = (root: Omit<CandidateSkillBundle, 'sourceDir'>) => {
-      const source = sourceMeta.get(root.sourceKey)
-      if (!source) throw new Error('cluster skill publisher returned an unknown source')
+      const sourceKind =
+        sourceMeta.get(root.sourceKey)?.sourceKind ?? priorKinds.get(`${root.relativeRoot}\0${root.sourceKey}`)
+      if (!sourceKind) throw new Error('cluster skill publisher returned an unknown source')
       return {
         path: root.relativeRoot,
         sourceId: root.sourceKey,
-        sourceKind: source.sourceKind,
+        sourceKind,
         digest: root.treeDigest,
         files: root.files.map(({ path, mode, size, sha256 }) => ({ path, mode, size, sha256 }))
       }
     }
     const candidates: CandidateSkillBundle[] = []
     const cleanups: Array<() => void> = []
+    // Sources whose CLI stage failed: reported, and their prior roots left exactly as they are.
+    const skipped: ClusterSkillSkippedSource[] = []
     try {
       const replayingPublication = await hasSkillPublicationOperation(
         this.deps.workspaceRoot,
@@ -309,29 +316,46 @@ export class ClusterSkillHandler {
       )
       for (const source of input.sources) {
         const snapshot = join(this.deps.stagingRoot, input.handle, sourceDirectory(source.sourceId))
-        const cell = await stageSkillsCliCell({
-          sourceSnapshot: snapshot,
-          agentId: operation.skillsAgentId,
-          selectedSkills: source.selections
-        })
-        cleanups.push(cell.cleanup)
-        for (const bundle of cell.bundles) {
-          const inspected = await inspectLocalSkillSource(bundle.absolutePath)
-          const files = inspected.files.map((file) => ({
-            path: file.path,
-            mode: file.mode & 0o111 ? 0o700 : 0o600,
-            size: file.size,
-            sha256: file.sha256.replace(/^sha256:/, '')
-          }))
-          candidates.push({
-            relativeRoot: bundle.relativePath,
-            sourceKey: source.sourceId,
-            sourceDir: bundle.absolutePath,
-            files,
-            treeDigest: treeDigest(files)
+        // One source failing its CLI stage — an oversized asset, too many files, a CLI crash — costs
+        // that source its skills for this run, never the agent its session: the others still publish,
+        // the failed source keeps whatever it had, and the daemon logs the named reason.
+        const staged: CandidateSkillBundle[] = []
+        try {
+          const cell = await stageSkillsCliCell({
+            sourceSnapshot: snapshot,
+            agentId: operation.skillsAgentId,
+            selectedSkills: source.selections
           })
+          cleanups.push(cell.cleanup)
+          for (const bundle of cell.bundles) {
+            const inspected = await inspectLocalSkillSource(bundle.absolutePath)
+            const files = inspected.files.map((file) => ({
+              path: file.path,
+              mode: file.mode & 0o111 ? 0o700 : 0o600,
+              size: file.size,
+              sha256: file.sha256.replace(/^sha256:/, '')
+            }))
+            staged.push({
+              relativeRoot: bundle.relativePath,
+              sourceKey: source.sourceId,
+              sourceDir: bundle.absolutePath,
+              files,
+              treeDigest: treeDigest(files)
+            })
+          }
+        } catch (error) {
+          if (mutationSignal.aborted) throw error
+          const reason = error instanceof Error ? error.message : 'unknown skills CLI error'
+          skipped.push({ sourceId: source.sourceId, reason: reason.slice(0, 1024) })
+          continue
         }
+        candidates.push(...staged)
       }
+      // A Git source id names its commit, so a skipped source's prior roots carry the PREVIOUS
+      // revision's id and cannot be matched by id. As on the daemon-local path, a run that skipped
+      // anything says nothing about intent: every prior root not rebuilt this run is preserved,
+      // and pruning waits for the next run that builds every source (shared-skills.md §6.3).
+      const preserveOwned = skipped.length > 0 ? input.priorRoots.map((root) => root.path) : []
       // Validate the largest possible result before publication; conflicts and installed roots are subsets of this set.
       const desiredRoots = [
         ...new Map(candidates.map((candidate) => [candidate.relativeRoot, ownedRoot(candidate)])).values()
@@ -355,7 +379,13 @@ export class ClusterSkillHandler {
         agentId: 'cluster-shim',
         runtime: operation.skillsAgentId,
         cliVersion: PINNED_SKILLS_CLI_VERSION,
-        fingerprint: createHash('sha256').update(JSON.stringify(input.sources)).digest('hex'),
+        // A run that skipped a source has not met its plan: never let its fingerprint short-circuit
+        // the next preparation's retry.
+        fingerprint:
+          skipped.length > 0
+            ? `failed:${randomBytes(16).toString('hex')}`
+            : createHash('sha256').update(JSON.stringify(input.sources)).digest('hex'),
+        ...(preserveOwned.length > 0 ? { preserveOwned } : {}),
         ...(replayingPublication
           ? {}
           : {
@@ -375,7 +405,8 @@ export class ClusterSkillHandler {
       })
       const reply = ClusterSkillReconcileResultSchema.parse({
         roots: result.owned.map(ownedRoot),
-        conflicts: result.conflicts
+        conflicts: result.conflicts,
+        ...(skipped.length > 0 ? { skipped } : {})
       })
       if (input.priorRootCount !== undefined) {
         operation.result = reply

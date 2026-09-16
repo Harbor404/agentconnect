@@ -19,8 +19,11 @@ import {
   SkillsCliCellError,
   stageSkillsCliCell,
   type ResolvedSkillsCli,
-  type SkillsCliRunOptions
+  type SkillsCliRunOptions,
+  DEFAULT_SKILLS_CLI_CELL_LIMITS
 } from '../src/skills/skills-cli-cell.js'
+import { MAX_SKILL_BUNDLE_BYTES, MAX_SKILL_FILE_BYTES } from '../src/skills/skill-limits.js'
+import { DEFAULT_SKILL_SOURCE_SNAPSHOT_LIMITS } from '../src/skills/skill-source-snapshot.js'
 
 describe('resolvePinnedSkillsCli', () => {
   let root: string
@@ -341,14 +344,28 @@ describe('scanSkillsCliCell', () => {
   it('enforces configurable file and byte caps', () => {
     const path = bundle('.runtime', 'skill')
     writeFileSync(join(path, 'extra'), '12345')
-    expect(() => scanSkillsCliCell(cwd, { maxFilesPerBundle: 1 })).toThrow('too many files')
-    expect(() => scanSkillsCliCell(cwd, { maxFileBytes: 4 })).toThrow('oversized file')
+    expect(() => scanSkillsCliCell(cwd, { maxFilesPerBundle: 1 })).toThrow('bundle "skill" has too many files')
+    // The operator fixing the source needs the bundle, the file, its size and the ceiling.
+    expect(() => scanSkillsCliCell(cwd, { maxFileBytes: 4 })).toThrow(
+      'bundle "skill" contains an oversized file: extra is 5 bytes (limit 4)'
+    )
   })
 
   it('applies depth and entry caps to layout prefixes as well as bundle contents', () => {
     bundle('one/two/three', 'skill')
     expect(() => scanSkillsCliCell(cwd, { maxDepth: 4 })).toThrow('depth limit')
     expect(() => scanSkillsCliCell(cwd, { maxEntries: 4 })).toThrow('too many entries')
+  })
+
+  it('shares its byte ceilings with the snapshot and the ledger (one number, every validator)', () => {
+    expect(DEFAULT_SKILLS_CLI_CELL_LIMITS.maxFileBytes).toBe(MAX_SKILL_FILE_BYTES)
+    expect(DEFAULT_SKILLS_CLI_CELL_LIMITS.maxBytesPerBundle).toBe(MAX_SKILL_BUNDLE_BYTES)
+    expect(DEFAULT_SKILL_SOURCE_SNAPSHOT_LIMITS.maxFileBytes).toBe(MAX_SKILL_FILE_BYTES)
+    expect(DEFAULT_SKILL_SOURCE_SNAPSHOT_LIMITS.maxTotalBytes).toBe(MAX_SKILL_BUNDLE_BYTES)
+    // The confined mutation helper cannot import these (builtins only) and restates them.
+    const helper = readFileSync(new URL('../src/skills/skill-workspace-mutation-cli.ts', import.meta.url), 'utf8')
+    expect(helper).toContain(`const MAX_FILE_BYTES = ${MAX_SKILL_FILE_BYTES / (1024 * 1024)} * 1024 * 1024`)
+    expect(helper).toContain(`const MAX_BUNDLE_BYTES = ${MAX_SKILL_BUNDLE_BYTES / (1024 * 1024)} * 1024 * 1024`)
   })
 
   it('rejects an empty cell', () => {

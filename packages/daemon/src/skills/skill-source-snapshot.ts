@@ -2,7 +2,12 @@ import { createHash } from 'node:crypto'
 import { constants, promises as fsp, type Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { TextDecoder } from 'node:util'
-import { MAX_SKILL_PATH_BYTES, MAX_SKILL_RECEIPT_FILES } from './skill-limits.js'
+import {
+  MAX_SKILL_PATH_BYTES,
+  MAX_SKILL_RECEIPT_FILES,
+  MAX_SKILL_BUNDLE_BYTES,
+  MAX_SKILL_FILE_BYTES
+} from './skill-limits.js'
 
 export interface SkillSourceSnapshotLimits {
   maxFiles: number
@@ -16,8 +21,10 @@ export interface SkillSourceSnapshotLimits {
 
 export const DEFAULT_SKILL_SOURCE_SNAPSHOT_LIMITS: Readonly<SkillSourceSnapshotLimits> = {
   maxFiles: MAX_SKILL_RECEIPT_FILES,
-  maxTotalBytes: 4 * 1024 * 1024,
-  maxFileBytes: 512 * 1024,
+  // One installed skill; byte ceilings match the CLI cell (skills-cli-cell.ts) so a bundle the cell
+  // admits is never refused one step later.
+  maxTotalBytes: MAX_SKILL_BUNDLE_BYTES,
+  maxFileBytes: MAX_SKILL_FILE_BYTES,
   maxEntries: 256,
   maxDepth: 32,
   maxPathBytes: MAX_SKILL_PATH_BYTES
