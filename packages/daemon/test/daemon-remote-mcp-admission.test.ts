@@ -73,7 +73,7 @@ function scaffold(opts: { builtin: boolean; runInSandbox: boolean }): string {
   return root
 }
 
-function fakeHost(rejectAdminDescriptor = false) {
+function fakeHost(rejectAdminDescriptor = false, toolUpdates: unknown[] = []) {
   let onUpdate!: (sid: string, update: unknown) => void
   const selectedAgents: Array<{ builtin: boolean; runInSandbox: boolean; runtime: string }> = []
   const host = {
@@ -87,6 +87,7 @@ function fakeHost(rejectAdminDescriptor = false) {
     modelOptions: vi.fn(() => null),
     hasSession: vi.fn(() => true),
     prompt: vi.fn(async (sid: string) => {
+      for (const update of toolUpdates) await onUpdate(sid, update)
       onUpdate(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } })
       return { stopReason: 'end_turn' }
     }),
@@ -120,8 +121,13 @@ function fakeGrantClient() {
   }
 }
 
-async function runTurn(opts: { builtin: boolean; runInSandbox: boolean; rejectAdminDescriptor?: boolean }) {
-  const { factory, host, selectedAgents } = fakeHost(opts.rejectAdminDescriptor)
+async function runTurn(opts: {
+  builtin: boolean
+  runInSandbox: boolean
+  rejectAdminDescriptor?: boolean
+  toolUpdates?: unknown[]
+}) {
+  const { factory, host, selectedAgents } = fakeHost(opts.rejectAdminDescriptor, opts.toolUpdates)
   const daemon = new Daemon({ root: scaffold(opts), hostFactory: factory as never })
   await daemon.start()
   const client = fakeGrantClient()
@@ -158,7 +164,7 @@ async function runTurn(opts: { builtin: boolean; runInSandbox: boolean; rejectAd
     }
   )
   await daemon.stop().catch(() => {})
-  return { client, host, selectedAgents, dones }
+  return { client, host, selectedAgents, dones, outputs }
 }
 
 function adminDescriptor(host: ReturnType<typeof fakeHost>['host']) {
@@ -170,28 +176,44 @@ function adminDescriptor(host: ReturnType<typeof fakeHost>['host']) {
 }
 
 describe('preset admin MCP through the webchat dispatch path', () => {
+  it('projects a direct HTTP tool result into one native card without proxying the admin call', async () => {
+    const nativeUi = {
+      resourceUri: 'ui://agentconnect/integration-setup',
+      resourceVersion: 1,
+      orgId: AUTHORITY,
+      intent: { mode: 'create', provider: 'github' }
+    }
+    const update = {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'direct-http-call',
+      status: 'completed',
+      rawInput: { server: 'agentconnect-admin', tool: 'configureIntegration', arguments: nativeUi.intent },
+      rawOutput: { result: { structuredContent: nativeUi }, error: null }
+    }
+    const { host, outputs } = await runTurn({ builtin: true, runInSandbox: true, toolUpdates: [update, update] })
+    expect(adminDescriptor(host)).toMatchObject({ type: 'http', url: 'https://cp.example/api/v1/mcp' })
+    const cards = outputs.filter((output) => output.event?.kind === 'app')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.event).toMatchObject({ nativeUi })
+  })
   it.each([
     ['without an OS sandbox', false],
     ['with an OS sandbox', true]
-  ] as const)(
-    'attaches to an arbitrary preset runtime %s',
-    async (_label, runInSandbox) => {
-      const { client, host, selectedAgents, dones } = await runTurn({ builtin: true, runInSandbox })
+  ] as const)('attaches to an arbitrary preset runtime %s', async (_label, runInSandbox) => {
+    const { client, host, selectedAgents, dones } = await runTurn({ builtin: true, runInSandbox })
 
-      expect(dones).toHaveLength(1)
-      expect(selectedAgents[0]).toMatchObject({
-        builtin: true,
-        runInSandbox,
-        runtime: 'arbitrary-acp'
-      })
-      expect(client.issueWebchatMcpGrant).toHaveBeenCalledTimes(1)
-      expect(client.acceptWebchatMcpGrant).toHaveBeenCalledTimes(1)
-      expect(adminDescriptor(host)?.headers).toEqual([{ name: 'Authorization', value: `Bearer ${TOKEN}` }])
-      // The credential is ACP session configuration, never model prompt text.
-      expect(JSON.stringify(host.prompt.mock.calls)).not.toContain(TOKEN)
-    },
-    20_000
-  )
+    expect(dones).toHaveLength(1)
+    expect(selectedAgents[0]).toMatchObject({
+      builtin: true,
+      runInSandbox,
+      runtime: 'arbitrary-acp'
+    })
+    expect(client.issueWebchatMcpGrant).toHaveBeenCalledTimes(1)
+    expect(client.acceptWebchatMcpGrant).toHaveBeenCalledTimes(1)
+    expect(adminDescriptor(host)?.headers).toEqual([{ name: 'Authorization', value: `Bearer ${TOKEN}` }])
+    // The credential is ACP session configuration, never model prompt text.
+    expect(JSON.stringify(host.prompt.mock.calls)).not.toContain(TOKEN)
+  })
 
   it('does not attach when a non-preset agent is handed a forged entitlement', async () => {
     const { client, host, dones } = await runTurn({ builtin: false, runInSandbox: false })
