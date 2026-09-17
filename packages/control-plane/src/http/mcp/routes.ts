@@ -34,7 +34,7 @@ import { API_V1_PREFIX } from '../version.js'
 import { OrgId } from '../../domain/ids.js'
 import { MCP_TOOLS, findTool, toolDescriptor, type McpToolCtx, type RestResult } from './tools.js'
 import { NATIVE_APPS, NATIVE_APP_MIME, nativeApp } from './native-apps.js'
-import { NativeMcpUi } from '@agentconnect.md/protocol/mcp-app'
+import { NativeMcpUi, NativeUiEnvelope } from '@agentconnect.md/protocol/mcp-app'
 import { publicBaseUrl, mcpAuthenticateChallenge } from '../oauth/base.js'
 import { INTERNAL_INVOCATION_AUTH_HEADER } from './internal-invocation-auth.js'
 import type { InvocationContext, ParsedInvocationMetadata } from './remote-grant-authenticator.js'
@@ -564,10 +564,21 @@ export function mcpRoutes(deps: HttpDeps) {
         }
         // 204/202-style successes have no body — still hand the model a definite answer.
         const content = [{ type: 'text' as const, text: result.body || `OK (HTTP ${result.statusCode})` }]
-        // A UI tool's whole answer IS the presentation intent, so it is republished as structured content.
-        if (tool.uiResourceUri && nativeApp(tool.uiResourceUri)) {
-          return { content, structuredContent: NativeMcpUi.parse(JSON.parse(result.body)) }
+        let body: unknown
+        try {
+          body = JSON.parse(result.body)
+        } catch {
+          // A 204/202 success, or a route that answered in something other than JSON.
         }
+        // A UI tool's whole answer IS the presentation intent, so it is republished as structured content.
+        if (tool.uiResourceUri && nativeApp(tool.uiResourceUri) && !tool.uiEnvelope) {
+          return { content, structuredContent: NativeMcpUi.parse(body) }
+        }
+        // ANY answer that carries a card beside it is republished too — a write tool's own, or the
+        // one `getOperation` lifts off an approved operation. A reader must not have to dig the
+        // intent out of a text block whose size the tool does not control.
+        const envelope = NativeUiEnvelope.safeParse(body)
+        if (envelope.success) return { content, structuredContent: envelope.data }
         return { content }
       })
 
