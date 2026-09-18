@@ -706,7 +706,7 @@ export function buildContainer(
     clock
   })
 
-  // Webchat admin-catalog entitlement (every agent, in its owner's private webchat) and its short-lived access grants.
+  // Webchat admin-catalog entitlement (every agent, in its owner's webchat conversation) and its short-lived access grants.
   const webchatMcpGrantToken = new WebchatMcpGrantTokenCodec(config.API_KEY_PEPPER)
   const webchatRemoteMcp = new WebchatRemoteMcpService({
     clock,
@@ -732,7 +732,6 @@ export function buildContainer(
     placement: placementResolver,
     grants: repos.webchatMcpAccessGrant,
     authorities: repos.webchatMcpDelegation,
-    sessions: repos.session,
     isCuratedTool: (toolName) => findTool(toolName) !== undefined
   })
   const internalInvocationAuth = new InternalInvocationAuth()
