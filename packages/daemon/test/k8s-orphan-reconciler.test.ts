@@ -4,6 +4,8 @@ import { K8sHttp } from '@agentconnect.md/k8s-client'
 import { closeFakeApiServers, fakeApiServer } from '@agentconnect.md/k8s-client/testing'
 import {
   DEFAULT_ORPHAN_GRACE_MS,
+  DEFAULT_MOVED_GRACE_MS,
+  MOVED_GRACE_ENV,
   ORPHAN_DELETE_ENV,
   ORPHAN_GRACE_ENV,
   OrphanReconciler,
@@ -35,6 +37,7 @@ const GONE = '22222222-2222-4222-8222-222222222222'
 const T0 = Date.parse('2026-08-14T10:00:00.000Z')
 const HOUR = 60 * 60_000
 const GRACE = 10 * 60_000
+const MOVED_GRACE = 7 * 24 * 3_600_000
 
 function claim(
   agentId: string,
@@ -120,6 +123,9 @@ async function cluster(
       return { json: {} }
     }
     if (url.pathname.endsWith('/sandboxclaims')) return { json: { items: claims } }
+    // A single claim read: what a refused stamp falls back to, so the degradation is reachable here.
+    const named = claims.find((entry) => url.pathname.endsWith(`/sandboxclaims/${entry.metadata?.name}`))
+    if (named) return { json: named }
     if (url.pathname.endsWith('/sandboxes')) {
       if (opts.sandboxList) return { status: opts.sandboxList, json: { kind: 'Status', reason: 'Forbidden' } }
       return { json: { items: sandboxes } }
@@ -139,7 +145,7 @@ function reconciler(over: Partial<OrphanReconcilerDeps> & { api: OrphanReconcile
       asked.push(ids)
       return new Set(ids.filter((id) => id === LIVE))
     },
-    settings: { graceMs: GRACE, deleteEnabled: true },
+    settings: { graceMs: GRACE, movedGraceMs: MOVED_GRACE, deleteEnabled: true },
     clock,
     log: { info: (m) => infos.push(m), warn: (m) => warns.push(m), debug: () => {} },
     ...over
@@ -151,13 +157,23 @@ describe('orphan reconciler settings', () => {
   it('defaults to a ten-minute grace and dry run', () => {
     expect(resolveOrphanReconcilerSettings({})).toEqual({
       graceMs: DEFAULT_ORPHAN_GRACE_MS,
+      movedGraceMs: DEFAULT_MOVED_GRACE_MS,
       deleteEnabled: false
     })
     expect(resolveOrphanReconcilerSettings({ [ORPHAN_GRACE_ENV]: '5000', [ORPHAN_DELETE_ENV]: 'true' })).toEqual({
       graceMs: 5_000,
+      movedGraceMs: DEFAULT_MOVED_GRACE_MS,
       deleteEnabled: true
     })
+    // The moved window is its own knob: a leak is collected in minutes, a departed agent's volume
+    // is a promise that ends on a schedule the deployment picks.
+    expect(resolveOrphanReconcilerSettings({ [MOVED_GRACE_ENV]: '60000' })).toEqual({
+      graceMs: DEFAULT_ORPHAN_GRACE_MS,
+      movedGraceMs: 60_000,
+      deleteEnabled: false
+    })
     expect(() => resolveOrphanReconcilerSettings({ [ORPHAN_GRACE_ENV]: '-1' })).toThrow(ORPHAN_GRACE_ENV)
+    expect(() => resolveOrphanReconcilerSettings({ [MOVED_GRACE_ENV]: 'soon' })).toThrow(MOVED_GRACE_ENV)
   })
 
   it('derives the members’ stamp cadence from whatever grace the sweep was given', () => {
@@ -194,7 +210,7 @@ describe('orphan reconciler', () => {
     ])
     // One existence read per run, covering every agent-bearing candidate at once.
     expect(r.asked).toEqual([[GONE, LIVE]])
-    expect(r.infos.at(-1)).toContain('orphaned=1 deleted=1 skipped-live=1 skipped-grace=0 failed=0')
+    expect(r.infos.at(-1)).toContain('orphaned=1 deleted=1 skipped-live=1 skipped-grace=0 moved=0 failed=0')
   })
 
   it('never touches an object of a live agent, claimless Sandbox included', async () => {
@@ -224,7 +240,7 @@ describe('orphan reconciler', () => {
 
   it('only reports in dry run, which is the default', async () => {
     const { api, deletes } = await cluster([claim(GONE)], [sandbox('sb-orphan', GONE)])
-    const r = reconciler({ api, settings: { graceMs: GRACE, deleteEnabled: false } })
+    const r = reconciler({ api, settings: { graceMs: GRACE, movedGraceMs: MOVED_GRACE, deleteEnabled: false } })
     expect(await r.it.sweep()).toMatchObject({ candidates: 2, orphaned: 2, deleted: 0 })
     expect(deletes).toEqual([])
     expect(r.infos.filter((m) => m.includes('would delete'))).toHaveLength(2)
@@ -279,6 +295,138 @@ describe('orphan reconciler', () => {
     expect(await r.it.sweep()).toMatchObject({ candidates: 1, orphaned: 1, deleted: 1 })
     expect(deletes).toHaveLength(1)
     expect(r.warns.filter((m) => m.includes('not permitted'))).toHaveLength(1)
+  })
+})
+
+describe('orphan reconciler and agents that moved off this pool', () => {
+  const MOVED = '33333333-3333-4333-8333-333333333333'
+  const LEAF = 'session-cccccccccccccccccccccccc'
+  // Live to `agent/exists`, but placed somewhere this pool is not, since `departedAt`.
+  const away = (departedAt: number, over: Partial<OrphanReconcilerDeps> & { api: OrphanReconcilerDeps['api'] }) =>
+    reconciler({
+      liveAgents: async (ids) => new Set(ids.filter((id) => id === LIVE || id === MOVED)),
+      movedAgents: async (ids) => new Map(ids.filter((id) => id === MOVED).map((id) => [id, departedAt])),
+      ...over
+    })
+
+  it('collects the agent pod AND the session pods once the placement change is past the window', async () => {
+    // Nothing here holds its duty any more, so no member suspends these pods or sweeps these
+    // sessions, and the daemon that holds the agent now reads a different store. This sweep is
+    // the only thing left that can reclaim them.
+    const left = T0 - MOVED_GRACE - HOUR
+    const { api, deletes } = await cluster(
+      [
+        claim(MOVED, { createdAt: left, sandbox: 'sb-moved' }),
+        sessionClaim(MOVED, LEAF, { createdAt: left, sandbox: 'sb-moved-session' }),
+        claim(LIVE, { sandbox: 'sb-live' })
+      ],
+      // A claimless Sandbox of a departed agent goes the same way; there is nothing special about it.
+      [sandbox('sb-stray', MOVED, left)]
+    )
+    const r = away(left, { api })
+    expect(await r.it.sweep()).toMatchObject({ candidates: 4, orphaned: 3, deleted: 3, moved: 3, skippedLive: 1 })
+    // The one agent still placed here is untouched, pod and volume.
+    expect(deletes.every((entry) => !entry.path.includes(LIVE))).toBe(true)
+  })
+
+  it('keeps a departed agent inside its window, however old and however long since its pod ran', async () => {
+    // The window IS the promise that a move can be undone; only its end may take the volume. The
+    // claim's own stamps say nothing about the move — a pod suspended before it stopped being
+    // stamped long before it — which is exactly why the control plane dates the departure.
+    const ancient = T0 - 10 * MOVED_GRACE
+    const { api, deletes } = await cluster(
+      [
+        claim(MOVED, { createdAt: ancient, sandbox: 'sb' }),
+        sessionClaim(MOVED, LEAF, { createdAt: ancient, admittedAt: ancient, sandbox: 'sb-s' })
+      ],
+      []
+    )
+    const r = away(T0 - GRACE, { api })
+    expect(await r.it.sweep()).toMatchObject({ candidates: 2, orphaned: 0, moved: 0, skippedGrace: 2 })
+    expect(deletes).toEqual([])
+  })
+
+  it('gives a second move its own full window rather than the remainder of the first', async () => {
+    // The case a mark the sweep wrote itself could never get right: an agent that left, came back
+    // and left again entirely between two ten-minute runs. The control plane saw all three.
+    const { api, deletes } = await cluster([claim(MOVED, { createdAt: T0 - 10 * MOVED_GRACE, sandbox: 'sb' })], [])
+    const r = away(T0 - 60_000, { api })
+    expect(await r.it.sweep()).toMatchObject({ orphaned: 0, moved: 0, skippedGrace: 1 })
+    expect(deletes).toEqual([])
+  })
+
+  it('keeps an object minted since the move, which the move cannot have left behind', async () => {
+    const { api, deletes } = await cluster([claim(MOVED, { createdAt: T0 - HOUR, sandbox: 'sb' })], [])
+    const r = away(T0 - 5 * MOVED_GRACE, { api })
+    expect(await r.it.sweep()).toMatchObject({ orphaned: 0, moved: 0, skippedGrace: 1 })
+    expect(deletes).toEqual([])
+  })
+
+  it('re-asks before deleting, and spares an agent that came back since the first answer', async () => {
+    // The placement answer at the top of a run is a snapshot, and the run does a lot of work
+    // between reading it and deleting against it. A return inside that gap must not lose its
+    // volume; what lands inside the LAST round trip is the claim's own version fence's to refuse.
+    const left = T0 - MOVED_GRACE - HOUR
+    const { api, deletes } = await cluster([claim(MOVED, { createdAt: left, sandbox: 'sb' })], [])
+    let answers = 0
+    const r = away(left, {
+      api,
+      movedAgents: async (ids) => (answers++ === 0 ? new Map(ids.map((id) => [id, left])) : new Map())
+    })
+    expect(await r.it.sweep()).toMatchObject({ candidates: 1, orphaned: 0, moved: 0, skippedLive: 1 })
+    expect(deletes).toEqual([])
+    expect(r.infos.some((line) => line.includes(`agent ${MOVED} is this pool's again`))).toBe(true)
+  })
+
+  it('gives a departure that happened SINCE the first read its own window, not the old one', async () => {
+    // Departed both times, but not the same departure: deleting against the first one's expired
+    // window would hand the second move no grace at all. The next run judges it from the start.
+    const left = T0 - MOVED_GRACE - HOUR
+    const { api, deletes } = await cluster([claim(MOVED, { createdAt: left, sandbox: 'sb' })], [])
+    let answers = 0
+    const r = away(left, {
+      api,
+      movedAgents: async (ids) => new Map(ids.map((id) => [id, answers++ === 0 ? left : T0 - 60_000]))
+    })
+    expect(await r.it.sweep()).toMatchObject({ orphaned: 0, moved: 0, skippedLive: 1 })
+    expect(deletes).toEqual([])
+    expect(r.infos.some((line) => line.includes('left this pool again since this sweep read it'))).toBe(true)
+  })
+
+  it('keeps a condemned object when the re-ask itself fails', async () => {
+    const left = T0 - MOVED_GRACE - HOUR
+    const { api, deletes } = await cluster([claim(MOVED, { createdAt: left, sandbox: 'sb' })], [])
+    let answers = 0
+    const r = away(left, {
+      api,
+      movedAgents: async (ids) => {
+        if (answers++ > 0) throw new Error('control plane blinked')
+        return new Map(ids.map((id) => [id, left]))
+      }
+    })
+    expect(await r.it.sweep()).toMatchObject({ orphaned: 0, moved: 0 })
+    expect(deletes).toEqual([])
+  })
+
+  it('leaves every live agent alone when the control plane cannot say where one is placed', async () => {
+    // A control plane without the placement answer is the pre-placement sweep: less, never more.
+    const { api, deletes } = await cluster([claim(MOVED, { createdAt: T0 - 5 * MOVED_GRACE, sandbox: 'sb' })], [])
+    const r = reconciler({ api, liveAgents: async (ids) => new Set(ids) })
+    expect(await r.it.sweep()).toMatchObject({ candidates: 1, orphaned: 0, moved: 0, skippedLive: 1 })
+    expect(deletes).toEqual([])
+  })
+
+  it('keeps a departed agent’s objects when the placement read itself fails', async () => {
+    const { api, deletes } = await cluster([claim(MOVED, { createdAt: T0 - 5 * MOVED_GRACE, sandbox: 'sb' })], [])
+    const r = away(T0 - 5 * MOVED_GRACE, {
+      api,
+      movedAgents: async () => {
+        throw new Error('control plane blinked')
+      }
+    })
+    expect(await r.it.sweep()).toMatchObject({ orphaned: 0, moved: 0, skippedLive: 1 })
+    expect(deletes).toEqual([])
+    expect(r.warns.some((line) => line.includes('left this pool'))).toBe(true)
   })
 })
 

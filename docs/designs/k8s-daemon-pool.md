@@ -346,6 +346,16 @@ presents, admitted on the same TokenReview path, but enrolled in no member set
 — so the duty ledger can never grant work to a process whose only job is to
 sweep — and marked so the pool-member reaper retires its row promptly.
 
+**A departing agent's pods are stopped by the detach itself.** Handing an agent
+over is not removal, so its claims and volumes stay — but `releaseAgent` drops
+the launches the idle sweep reads, and that sweep is the holder's alone, so a pod
+not stopped at the handover is one nothing on this member will ever stop again.
+`agent/detach` therefore suspends the agent's own pod and every session pod it
+can adopt before it releases them (`suspendClusterSandboxes`), leaving the
+objects and the volumes untouched. Best effort, and never a reason to fail the
+ACK: a pod left running is cost, not incorrectness, and refusing the move over it
+would strand the agent between two daemons — the sweep above is the backstop.
+
 **What it collects.** It lists the claims and Sandboxes that carry the
 install's agent label (`agentconnect.md/agent` on the pod metadata), asks the
 control plane in **one batched read per run** which of those agent ids still
@@ -374,7 +384,7 @@ one-shot job has, since it keeps no memory of an earlier run. Every delete
 carries the UID and resourceVersion from the LIST snapshot, so a same-name
 replacement created after the list is never the object deleted. Each run logs
 one summary line (candidates, orphaned, deleted, skipped-live, skipped-grace,
-failed).
+moved, failed).
 
 **The admission fence.** A session row's absence is a snapshot, and a session
 can come back between that read and the delete — its admission REUSES the
@@ -391,9 +401,144 @@ makes its preconditioned delete fail — reported as "replaced since it was
 listed", with the pod and its volume left alone and the next run re-deciding.
 A second uncoordinated row read would only have narrowed that window.
 
+**An agent that MOVED off the pool.** Placement, not existence, is the question
+the sweep actually has, and the two differ in exactly the case neither guard
+could reach. When an agent moves to a self-hosted daemon (or to any placement
+that is not this member set), its claims, volumes and session rows stay behind,
+and every rule reads them as live: no member holds its duty, so none suspends
+its pods (§4, the idle sweep is the holder's) or sweeps its sessions (the
+retention sweep is holder-only, because its active-turn exclusions are
+member-local), while `agent/exists` reports the agent as perfectly alive. The
+daemon that holds it now reads a different store. Nothing would ever collect
+them.
+
+So the observer asks `agent/exists` with `placedOnSetId` — the pool it sweeps
+for, as the control plane itself resolved it from this pod's identity at `auth`
+(the observer registration that follows withdraws that membership again, which
+is why it is read there) — and the reply adds `elsewhere`: the surviving ids
+placement no longer puts on that set, **each with when its placement last
+changed** (`Agent.placementChangedAt`, written by `settlePlacementChange` in the
+same transaction as the columns). Gated on the `agent-placement-v1` server
+feature; an older control plane drops the field and answers existence alone,
+which is the pre-placement sweep and collects strictly less.
+
+That timestamp has to come from the control plane, because nothing at the
+sweeping end can derive it. A claim's admission stamp dates its last USE, and a
+pod suspended before the move stopped being stamped long before it, so reading
+the departure off it would take the volume of an agent moved five minutes ago. A
+mark the sweep wrote itself on first observation fixes that case and not the next
+one: an agent that left, came back and left again entirely between two of these
+ten-minute runs is invisible to the sweep, and the second move would inherit the
+first's spent window. A scheduled observer cannot infer an unobserved round trip
+from the current placement alone, so the writer of the change records it.
+
+On that answer:
+
+- the claims of a departed agent — its own pod's and its session pods' — age out
+  on their own window, `AC_MOVED_AGENT_GRACE_MS` (default 7 days), NOT the leak
+  grace. A leak is a mistake to clean up in minutes; a move is deliberate, and
+  the volume left behind is the promise that the work is still there to move back
+  to. The window is where that promise ends.
+
+  Both clocks have to be past the window: the placement change, and the object's
+  own age as every other rule reads it. The first is what the window is about;
+  the second keeps an object minted since the move — which the move cannot have
+  left behind — out of it.
+
+- its expired session rows are purged on the same window by the same job
+  (`purgeMovedAgentSessions`), through the ordinary `deleteSession` — receipt
+  and all. The rule above already takes those sessions' pods; this is the store
+  half of the same decision, and the backstop for a session pod whose claim the
+  cluster half could not reach, since such a claim lives exactly as long as its
+  row.
+- its store rows collect on **agent moved**, the store half's sibling of the
+  agent-gone proof below, under the same dry-run flag.
+
+**A departure is re-confirmed at the destructive boundary.** The placement answer
+is a snapshot, and the run does two store sweeps' worth of work between reading it
+and deleting against it, so the departures a sweep condemned are re-asked
+immediately before it deletes — and the same re-ask guards
+`purgeMovedAgentSessions`, because a row purged after its agent came back takes
+the session's pod and volume with it on the next run. The timestamp has to MATCH,
+not merely still be present: an agent that returned and left again reads as
+departed both times, and the second departure has served none of its window, so a
+changed `placementChangedAt` is a return and the next run judges the new departure
+from the start. A re-ask that fails keeps everything.
+
+Placement is therefore never cached across a run, unlike existence. An agent can
+only stop existing, so a cached "still known" is stale only towards keeping
+objects; placement moves both ways, and that is exactly what a destructive pass
+must not hold an old copy of.
+
+**The residual window, accepted deliberately.** What the re-ask leaves is the gap
+between that last read and the DELETE itself — one round trip. Inside it, a
+return is supposed to be refused by the UID/resourceVersion precondition every
+delete carries, which is why a member taking an agent over marks every claim of
+it (`markServed`), the suspended ones `adopt()` skips included. But that mark is
+EVENTUAL, not ordered with the placement commit: `movePlacement()` commits the
+columns, `recomputeDuties()` updates the ledger after it, and `duty/grant` →
+`adoptClusterSandbox()` → `markServed()` run asynchronously after that. A return
+that lands in the gap before any member reaches the claim therefore still matches
+the version the delete carries.
+
+Closing it properly needs a fence whose invalidation is ordered with the placement
+write — a placement generation the control plane hands out as a cleanup
+authorization and invalidates in the same transaction as the columns, or the
+collection decision moved into the control plane across two CronJob runs. That is
+a control-plane design change, and it is deliberately not taken here. The residual
+is accepted instead. It is not one residual, though: the three destructive paths
+this section describes are exposed differently, and only the first two are covered
+by the window and the re-ask at all.
+
+**The claims.** Four things have to hold at once: the agent has been off this pool
+for at least `AC_MOVED_AGENT_GRACE_MS` (default 7 days) and the object it left is
+at least that old too; it returns inside the one round trip between the sweep's
+final placement read and its delete; no member touches its claims in that same
+interval; and the deployment has turned collection on, which it ships without.
+
+What that costs is **possible permanent loss of retained pool-local workspace
+state** — not a cache, and not merely a slower next start. The claim's PVC IS the
+durable workspace: a move is a hard cutover that does not migrate workspace bytes
+(`orchestrator/agentMove.ts`), so scratch files and uncommitted edits left on it
+may exist nowhere else, and an agent that returns while the claim survives resumes
+onto exactly those bytes. Deleting the claim is what forces a fresh
+materialization, and it is why the window exists at all. An operator who wants
+that state held longer raises the window rather than relying on this gap.
+
+**The moved-session purge** carries the same window and the same late re-ask, so
+it needs the first two conditions too. Its rows have no version fence of their own,
+so what protects it is the re-ask alone; a purge that wins the race deletes the
+session row, and the next sweep then takes that session's pod and volume on the
+rule above.
+
+**The generic store sweep is the wide one, and it shares none of that.**
+`StoreRetentionSweeper.classify()` returns `agent-moved` before it evaluates any
+horizon, so a departed agent's rows are collected however new they are — no moved
+window, no object age — and the sweep reads placement once and then deletes row by
+row, so the exposed interval is that whole delete loop rather than a round trip.
+A return inside it discards rows that are the returned agent's again, and they are
+obligations rather than history: an unacknowledged terminal `hook-report` is a
+turn's result the control plane then never receives; a `delivery-receipt` is the
+dedup record whose loss lets a provider redelivery re-run a settled turn; a
+`session-purge` receipt is the only record that a transcript was deleted; plus
+queued `session-metadata`, the `webchat-grant` ledger, `outward-id`s and terminal
+memory captures.
+
+That path is left as it is because the trigger is an operator moving an agent off
+this pool and back onto it inside a seconds-wide loop that runs once every ten
+minutes, and because for an agent that really left, deleting those rows promptly is
+the whole point — nothing in this pool will ever drain them. Narrowing it would
+mean giving `agent-moved` the moved window and the late re-ask the other two paths
+have, which is the change to make if this is ever observed rather than reasoned
+about.
+
 **Dry run by default.** The reconciler ships reporting only; deletion is
-enabled per deployment with `AC_K8S_ORPHAN_DELETE=true` after an observation
-window in which the summary lines show it collecting exactly what an operator
+enabled per deployment with `AC_K8S_ORPHAN_DELETE=true` (and
+`AC_STORE_ORPHAN_DELETE=true` for the store half — the chart's
+`daemonPool.reconciler.delete` projects both from one decision, because the two
+halves collect the two halves of the same thing and enabling one alone reclaims
+a departed agent's pods and PVCs while their rows stay dry-run forever) after an
+observation window in which the summary lines show it collecting exactly what an operator
 would (`AC_K8S_ORPHAN_GRACE_MS` tunes the grace). It replaced the dedicated
 probe-claim GC, and agent removal's sandbox teardown is best-effort because of
 it: `discardAgent` deletes the claim once and logs a failure, and the
@@ -427,6 +572,10 @@ Two proofs collect a row:
   member can ever drain it. This needs the batched `agent/exists` answer the
   cluster half already asked for, so only `reconcile --once` can apply it, and
   it ships dry-run behind `AC_STORE_ORPHAN_DELETE=true`.
+- **agent moved** — the agent lives, but the control plane no longer places it
+  on this set. Same dead end and same proof shape: no member here holds its
+  duty, so none will ever drain the row, and the daemon that holds the agent now
+  reads a different store. Same answer, same dry-run flag.
 
 `ownerColumn` carries the third case: a row written by a process that is not the
 sweeper. An `ownerId` dies with the process that minted it, so the catalog rules

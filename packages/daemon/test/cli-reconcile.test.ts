@@ -15,7 +15,7 @@ import {
 } from '../src/k8s/sandbox-identity.js'
 import { hostKeyDirName, sessionHostKey } from '../src/acp/host-key.js'
 import { SandboxApi, type SandboxClaim } from '../src/k8s/sandbox-api.js'
-import { ORPHAN_DELETE_ENV } from '../src/k8s/orphan-reconciler.js'
+import { DEFAULT_MOVED_GRACE_MS, ORPHAN_DELETE_ENV } from '../src/k8s/orphan-reconciler.js'
 import { STORE_ORPHAN_DELETE_ENV } from '../src/store/retention.js'
 import type { StoreRetentionCandidate, StoreRetentionRule } from '../src/store/retention.js'
 import { K8S_SANDBOX_NAMESPACE_ENV } from '../src/k8s/runtime-plane.js'
@@ -26,6 +26,7 @@ afterEach(closeFakeApiServers)
 
 const LIVE = '11111111-1111-4111-8111-111111111111'
 const GONE = '22222222-2222-4222-8222-222222222222'
+const MOVED = '33333333-3333-4333-8333-333333333333'
 const OLD = new Date(Date.now() - 60 * 60_000).toISOString()
 
 function claim(agentId: string): SandboxClaim {
@@ -68,14 +69,22 @@ async function cluster(opts: { deleteStatus?: number; extraClaims?: SandboxClaim
   return { api: new SandboxApi(new K8sHttp(config), 'agent-sandboxes'), deletes }
 }
 
-/** A control plane that knows only `LIVE`, recording what the sweep asked it. */
-function fakeCp() {
+/** A control plane that knows only `LIVE`, recording what the sweep asked it. `moved` names ids it
+ *  reports as living somewhere other than this pool. */
+function fakeCp(moved: readonly string[] = [], movedSince = 0) {
   const asked: string[][] = []
   let closed = false
   const connectCp = async (): Promise<ExistenceReader> => ({
-    liveAgents: async (ids: string[]) => {
+    readAgents: async (ids: string[]) => {
       asked.push(ids)
-      return new Set(ids.filter((id) => id === LIVE))
+      return new Map(
+        ids
+          .filter((id) => id === LIVE || moved.includes(id))
+          .map((id) => [
+            id,
+            moved.includes(id) ? ({ at: 'elsewhere', since: movedSince } as const) : ({ at: 'here' } as const)
+          ])
+      )
     },
     close: () => {
       closed = true
@@ -97,7 +106,10 @@ describe('reconcile --once', () => {
       log: { info: (m) => infos.push(m), warn: (m) => infos.push(m) }
     })
     expect(code).toBe(0)
-    expect(cp.asked).toEqual([[LIVE, GONE]])
+    // Existence is asked once and cached — an agent can only stop existing. Placement is re-asked,
+    // because it moves both ways and a destructive pass must not hold a stale copy of it.
+    expect(cp.asked[0]).toEqual([LIVE, GONE])
+    expect(cp.asked.slice(1).every((ids) => ids.every((id) => [LIVE, GONE].includes(id)))).toBe(true)
     expect(deletes).toEqual([
       `/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/agent-sandboxes/sandboxclaims/agent-${GONE}`
     ])
@@ -106,9 +118,10 @@ describe('reconcile --once', () => {
     expect(cp.wasClosed()).toBe(true)
   })
 
-  it('sweeps the shared store in the same run, on the same control-plane answer', async () => {
+  it('sweeps the shared store in the same run, on the same existence answer', async () => {
     // One CronJob covers both halves because they ask the same question: `agent/exists` decides
-    // whether a SandboxClaim and an outbox row alike are leaked.
+    // whether a SandboxClaim and an outbox row alike are leaked. Existence is asked ONCE — an agent
+    // can only stop existing, so a cached answer can only ever be stale towards keeping things.
     const { api } = await cluster()
     const cp = fakeCp()
     const infos: string[] = []
@@ -128,15 +141,84 @@ describe('reconcile --once', () => {
       log: { info: (m) => infos.push(m), warn: (m) => infos.push(m) }
     })
     expect(code).toBe(0)
-    expect(cp.asked).toEqual([
-      [LIVE, GONE],
-      [LIVE, GONE]
-    ])
+    // One existence read for both halves; the placement re-reads that follow name only live agents.
+    expect(cp.asked[0]).toEqual([LIVE, GONE])
+    expect(cp.asked.slice(1).every((ids) => !ids.includes(GONE))).toBe(true)
     expect(deleted).toEqual(['row-session-purge'])
     expect(infos.at(-1)).toContain('store retention: swept 2 candidates — collected=1 deleted=1 kept=1 failed=0')
-    expect(infos.at(-1)).toContain('agent-gone=1 horizon=0')
+    expect(infos.at(-1)).toContain('agent-gone=1 agent-moved=0 horizon=0')
     expect(infos.at(-1)).toContain('session-purge=1')
     expect(closed).toBe(true)
+  })
+
+  it('purges the expired sessions of an agent that moved off this pool, and nobody else’s', async () => {
+    // The members' own retention sweep is holder-only, so these rows have no judge left: this run
+    // is what makes them expire — and what makes their pods collectable on the NEXT run, since a
+    // session pod's claim lives exactly as long as its row.
+    const { api } = await cluster()
+    const cp = fakeCp([MOVED])
+    const infos: string[] = []
+    const purged: string[] = []
+    const cutoffs: number[] = []
+    const now = Date.now()
+    const code = await runReconcileOnce({
+      api,
+      connectCp: cp.connectCp,
+      apiUrl: 'wss://cp.example.test/daemon/ws',
+      env: { [STORE_ORPHAN_DELETE_ENV]: 'true' },
+      openStore: async () => ({
+        store: {
+          ...storeOf({}, []),
+          listExpiredSessions: async (cutoff: number) => {
+            cutoffs.push(cutoff)
+            return [
+              { key: 'slack:C1:T-moved:agent', agentId: MOVED },
+              { key: 'slack:C1:T-here:agent', agentId: LIVE }
+            ] as never
+          },
+          deleteSession: async (key: string) => {
+            purged.push(key)
+            return true
+          }
+        },
+        close: async () => {}
+      }),
+      log: { info: (m) => infos.push(m), warn: (m) => infos.push(m) }
+    })
+    expect(code).toBe(0)
+    // Only the departed agent's row; the one still placed here is its holder's to judge.
+    expect(purged).toEqual(['slack:C1:T-moved:agent'])
+    // Expiry runs on the moved window, not the leak grace.
+    expect(cutoffs[0]).toBeGreaterThanOrEqual(now - DEFAULT_MOVED_GRACE_MS)
+    expect(cutoffs[0]).toBeLessThanOrEqual(Date.now() - DEFAULT_MOVED_GRACE_MS)
+    expect(infos.at(-1)).toContain('moved sessions: 1 expired session(s) of departed agents — purged=1 failed=0')
+  })
+
+  it('only reports the sessions of a departed agent until the deployment turns deletion on', async () => {
+    const { api } = await cluster()
+    const purged: string[] = []
+    const infos: string[] = []
+    const code = await runReconcileOnce({
+      api,
+      connectCp: fakeCp([MOVED]).connectCp,
+      apiUrl: 'wss://cp.example.test/daemon/ws',
+      env: {},
+      openStore: async () => ({
+        store: {
+          ...storeOf({}, []),
+          listExpiredSessions: async () => [{ key: 'slack:C1:T:agent', agentId: MOVED }] as never,
+          deleteSession: async (key: string) => {
+            purged.push(key)
+            return true
+          }
+        },
+        close: async () => {}
+      }),
+      log: { info: (m) => infos.push(m), warn: (m) => infos.push(m) }
+    })
+    expect(code).toBe(0)
+    expect(purged).toEqual([])
+    expect(infos.some((m) => m.includes('would purge slack:C1:T:agent'))).toBe(true)
   })
 
   it('asks the shared store which session pods still have a row, and collects the rest (§11)', async () => {
@@ -224,7 +306,7 @@ describe('reconcile --once', () => {
     })
     expect(code).toBe(1)
     expect(deletes).toHaveLength(1)
-    expect(logged.at(-1)).toContain('orphaned=1 deleted=0 skipped-live=1 skipped-grace=0 failed=1')
+    expect(logged.at(-1)).toContain('orphaned=1 deleted=0 skipped-live=1 skipped-grace=0 moved=0 failed=1')
   })
 
   it('exits 1 when the control plane cannot be reached, deleting nothing', async () => {
@@ -315,7 +397,7 @@ describe('observer connection', () => {
     expect((sent[0]!.payload as { serviceAccountToken: string }).serviceAccountToken).toBe('projected-token')
     expect(sent[1]!.payload).toMatchObject({ observer: true, maxAgents: 0 })
 
-    expect(await cp.liveAgents([LIVE, GONE])).toEqual(new Set([LIVE]))
+    expect(await cp.readAgents([LIVE, GONE])).toEqual(new Map([[LIVE, { at: 'here' }]]))
     cp.close()
     expect(transport.closed?.code).toBe(1000)
   })

@@ -21,6 +21,37 @@ import type { Sandbox, SandboxApi, SandboxClaim } from './sandbox-api.js'
  * not even a claimless Sandbox — an unreadable answer fails the sweep, and a session nobody can
  * answer for reads as live. Ships dry-run: it logs and counts until the deployment enables deletion.
  *
+ * One live agent's objects ARE collectable: one the control plane no longer places on this pool. No
+ * member holds its duty, so none suspends its pods or sweeps its sessions, and the daemon that holds
+ * it now reads a different store — these objects have no owner left anywhere. They age out on their
+ * own, much longer window ({@link MOVED_GRACE_ENV}), because a move is reversible by design and the
+ * volume left behind is that promise; the window is where the promise ends.
+ *
+ * The placement answer is a SNAPSHOT, so a departure is re-confirmed immediately before the
+ * destructive pass rather than trusted from the top of the run, and the timestamp has to MATCH: an
+ * agent that returned and left again reads as departed both times, and the second departure has
+ * served none of its window.
+ *
+ * One round trip is left between that read and the delete. A return inside it is meant to be refused
+ * by the UID/resourceVersion precondition every delete carries — which is why a member taking an
+ * agent over marks every claim of it, the suspended ones adoption skips included — but that mark is
+ * EVENTUAL, not ordered with the placement commit (the CP commits the columns, recomputes duties
+ * after, and grant → adopt → mark run asynchronously after that). So the gap is real and accepted
+ * deliberately: closing it needs a fence the control plane invalidates in the same transaction as
+ * the placement write, which is a CP design change and not taken here. It costs something only when
+ * an agent a week gone returns inside that round trip, before any member reaches its claims, on an
+ * install that has turned collection on — and then it costs the pool-local workspace state that
+ * volume holds, which a return would otherwise have resumed onto and which a hard-cutover move
+ * never copied anywhere else. §4 records that, and the wider residual the generic store sweep
+ * carries, which shares neither this window nor this re-ask.
+ *
+ * That window runs from the control plane's own record of WHEN the placement changed, which the
+ * placement answer carries. Nothing this sweep can observe would do: a claim's admission stamp dates
+ * its last USE, and for a pod suspended before the move that is long before the move, so it would
+ * delete the volume of an agent moved five minutes ago; and a mark the sweep wrote itself could not
+ * see a departure, return and second departure that all happened between two of its ten-minute runs,
+ * so the second move would inherit the first's spent window. Only the writer of the change knows.
+ *
  * The absence proof is a SNAPSHOT, so it is fenced by the claim's own version rather than trusted on
  * its own. A member stamps every claim it admits AND every claim it currently holds a launch for
  * (`agentconnect.md/last-admitted-at`, refreshed on a tick well inside the grace), so the stamp reads
@@ -38,6 +69,13 @@ export const ORPHAN_GRACE_ENV = 'AC_K8S_ORPHAN_GRACE_MS'
 /** Deletion is opt-in: `1`/`true` collects, anything else only reports. */
 export const ORPHAN_DELETE_ENV = 'AC_K8S_ORPHAN_DELETE'
 export const DEFAULT_ORPHAN_GRACE_MS = 10 * 60_000
+/** How long the objects of an agent that MOVED off this pool are kept. Its own knob, not the leak
+ *  grace: a leak is a mistake to clean up in minutes, a move is a deliberate act whose left-behind
+ *  volume is the promise that the work is still there to move back to. The default matches the
+ *  install's default session retention, so the pods of a departed agent go when its sessions would
+ *  have expired anyway. */
+export const MOVED_GRACE_ENV = 'AC_MOVED_AGENT_GRACE_MS'
+export const DEFAULT_MOVED_GRACE_MS = 7 * 24 * 3_600_000
 
 /**
  * How often a member must re-stamp the claims it holds, for a sweep that waits `graceMs`.
@@ -55,19 +93,26 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export interface OrphanReconcilerSettings {
   graceMs: number
+  /** The window for an object whose agent moved off this pool; see {@link MOVED_GRACE_ENV}. */
+  movedGraceMs: number
   deleteEnabled: boolean
 }
 
 export function resolveOrphanReconcilerSettings(env: NodeJS.ProcessEnv = process.env): OrphanReconcilerSettings {
-  const raw = env[ORPHAN_GRACE_ENV]?.trim()
-  let graceMs = DEFAULT_ORPHAN_GRACE_MS
-  if (raw) {
-    const value = Number(raw)
-    if (!Number.isInteger(value) || value <= 0) throw new Error(`${ORPHAN_GRACE_ENV} is not a positive integer: ${raw}`)
-    graceMs = value
-  }
   const flag = env[ORPHAN_DELETE_ENV]?.trim().toLowerCase()
-  return { graceMs, deleteEnabled: flag === '1' || flag === 'true' }
+  return {
+    graceMs: positiveMs(env, ORPHAN_GRACE_ENV, DEFAULT_ORPHAN_GRACE_MS),
+    movedGraceMs: positiveMs(env, MOVED_GRACE_ENV, DEFAULT_MOVED_GRACE_MS),
+    deleteEnabled: flag === '1' || flag === 'true'
+  }
+}
+
+function positiveMs(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]?.trim()
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} is not a positive integer: ${raw}`)
+  return value
 }
 
 /** One sweep's counters, also the shape of its summary log line. */
@@ -78,12 +123,18 @@ export interface OrphanSweepSummary {
   skippedLive: number
   skippedGrace: number
   failed: number
+  /** Of `orphaned`, those collected because their agent moved off this pool rather than vanished. */
+  moved: number
 }
 
 export interface OrphanReconcilerDeps {
   api: Pick<SandboxApi, 'listClaims' | 'deleteClaimIfCurrent' | 'listSandboxes' | 'deleteSandboxIfCurrent'>
   /** Which of these agents the control plane still knows; a throw fails the sweep. */
   liveAgents: (agentIds: string[]) => Promise<Set<string>>
+  /** Of the live ones, those the control plane no longer places on THIS pool, each mapped to the
+   *  epoch ms its placement last changed. Absent, or an empty answer from a control plane that
+   *  cannot tell, leaves every live agent's objects alone. */
+  movedAgents?: (agentIds: string[]) => Promise<Map<string, number>>
   /** Which of these session pods still have a session row, as `<agentId>/<leaf>` subjects; absent or throwing ⇒ every session pod reads as live. */
   liveSessionLeaves?: (sessions: Array<{ agentId: string; leaf: string }>) => Promise<Set<string>>
   settings: OrphanReconcilerSettings
@@ -149,13 +200,16 @@ export class OrphanReconciler {
       deleted: 0,
       skippedLive: 0,
       skippedGrace: 0,
-      failed: 0
+      failed: 0,
+      moved: 0
     }
     // Probe agents are member-local and never known to the control plane, so they are not asked about.
     const askable = [
       ...new Set(candidates.filter((c) => c.kind !== 'probe-claim' && UUID.test(c.agentId)).map((c) => c.agentId))
     ]
     const live = askable.length > 0 ? await this.deps.liveAgents(askable) : new Set<string>()
+    // Asked of the live ones only: a gone agent is already collectable on the shorter window.
+    const moved = await this.movedAway([...live])
     // Session pods of LIVE agents are asked about once per run; an agent's death already collects its sessions' pods.
     const liveSessions = await this.liveSessions(
       candidates.filter((c) => c.kind !== 'probe-claim' && c.sessionLeaf !== undefined && live.has(c.agentId))
@@ -175,6 +229,20 @@ export class OrphanReconciler {
         continue
       }
       if (live.has(candidate.agentId)) {
+        // An agent the control plane moved off this pool: nothing here will ever serve this object
+        // again, so it ages out — on the moved window, from the departure stamp this sweep writes.
+        const departedAt = moved.get(candidate.agentId)
+        if (departedAt !== undefined) {
+          // The object's own age still applies — it must be at least as old as the window too — so a
+          // claim minted after the move is not taken for one the move left behind.
+          if (now - departedAt < settings.movedGraceMs || !pastWindow(candidate, now, settings.movedGraceMs)) {
+            summary.skippedGrace += 1
+            continue
+          }
+          summary.moved += 1
+          orphans.push(candidate)
+          continue
+        }
         // A live agent's own pod is never touched; its session pod only when its row is PROVABLY gone (§11).
         const leaf = candidate.sessionLeaf
         if (
@@ -186,20 +254,21 @@ export class OrphanReconciler {
           continue
         }
       }
-      // The object's own age IS the grace: a one-shot run has no memory of an earlier sweep, and this
-      // is the clock that matters anyway — no in-flight creation can still be racing the CP's write.
-      // Age runs from the LATER of creation and the last time a member admitted or refreshed this claim,
-      // because one in use — or one a returning session re-admitted — is young again, and only the stamp says so.
-      const since =
-        candidate.admittedAt === undefined ? candidate.createdAt : Math.max(candidate.createdAt, candidate.admittedAt)
-      if (!(Number.isFinite(since) && now - since >= settings.graceMs)) {
+      if (!pastWindow(candidate, now, settings.graceMs)) {
         summary.skippedGrace += 1
         continue
       }
       orphans.push(candidate)
     }
-    summary.orphaned = orphans.length
-    for (const orphan of orphans) {
+    // Re-ask about the ones a DEPARTURE condemned, as late as possible. The answer above was read
+    // before the whole sweep's work, and a returning agent must not be deleted against a snapshot
+    // that predates its return. This narrows that to one round trip; what lands inside it is the
+    // version fence's to refuse, which is why a takeover marks the claims it did not adopt.
+    const confirmed = await this.stillGone(orphans, moved)
+    summary.moved -= orphans.length - confirmed.length
+    summary.skippedLive += orphans.length - confirmed.length
+    summary.orphaned = confirmed.length
+    for (const orphan of confirmed) {
       if (!settings.deleteEnabled) {
         log.info(`k8s orphans: would delete ${orphan.kind} ${orphan.name} (${ownerOf(orphan)}) — dry run`)
         continue
@@ -219,10 +288,54 @@ export class OrphanReconciler {
     }
     log.info(
       `k8s orphans: swept ${summary.candidates} candidates — orphaned=${summary.orphaned} deleted=${summary.deleted} ` +
-        `skipped-live=${summary.skippedLive} skipped-grace=${summary.skippedGrace} failed=${summary.failed}` +
+        `skipped-live=${summary.skippedLive} skipped-grace=${summary.skippedGrace} moved=${summary.moved} ` +
+        `failed=${summary.failed}` +
         (settings.deleteEnabled ? '' : ' (dry run)')
     )
     return summary
+  }
+
+  /**
+   * The orphans still worth deleting: everything a departure did not condemn, plus those whose agent
+   * the control plane still places elsewhere on the SAME departure it was condemned on.
+   *
+   * The timestamp has to match, not merely be present. An agent that returned and left again reads
+   * as departed both times, but the second departure is a new one and has served none of its window —
+   * deleting it against the first one's expired window would give it no grace at all. A changed
+   * timestamp is therefore a return, and the next run judges the new departure from the start.
+   *
+   * A read that fails keeps everything, which is the safe direction: an agent whose placement nobody
+   * can confirm is not collected.
+   */
+  private async stillGone(orphans: Candidate[], moved: Map<string, number>): Promise<Candidate[]> {
+    const departed = [...new Set(orphans.map((o) => o.agentId).filter((id) => moved.has(id)))]
+    if (departed.length === 0) return orphans
+    const still = await this.movedAway(departed)
+    const condemned = new Set(departed.filter((id) => still.get(id) === moved.get(id)))
+    for (const id of departed) {
+      if (condemned.has(id)) continue
+      this.deps.log.info(
+        still.has(id)
+          ? `k8s orphans: agent ${id} left this pool again since this sweep read it — its new window starts fresh`
+          : `k8s orphans: agent ${id} is this pool's again — leaving what it left behind`
+      )
+    }
+    return orphans.filter((o) => !moved.has(o.agentId) || condemned.has(o.agentId))
+  }
+
+  // Fail-closed like every other read here: a control plane that cannot say where an agent is placed
+  // leaves every live agent's objects exactly as the pre-placement sweep left them.
+  private async movedAway(liveIds: string[]): Promise<Map<string, number>> {
+    const ask = this.deps.movedAgents
+    if (!ask || liveIds.length === 0) return new Map()
+    try {
+      return await ask(liveIds)
+    } catch (err) {
+      this.deps.log.warn(
+        `k8s orphans: could not ask which agents left this pool — keeping every live agent's objects (${(err as Error).message})`
+      )
+      return new Map()
+    }
   }
 
   // Fail-closed: no store to ask, or a store that will not answer, keeps every session pod of a live agent.
@@ -262,6 +375,21 @@ export class OrphanReconciler {
       ? this.deps.api.deleteSandboxIfCurrent(orphan.name, preconditions)
       : this.deps.api.deleteClaimIfCurrent(orphan.name, preconditions)
   }
+}
+
+/**
+ * Is this object older than the window?
+ *
+ * The object's own age IS the grace: a one-shot run has no memory of an earlier sweep, and this is
+ * the clock that matters anyway — no in-flight creation can still be racing the CP's write. Age runs
+ * from the LATER of creation and the last time a member admitted or refreshed this claim, because one
+ * in use — or one a returning session re-admitted — is young again, and only the stamp says so. An
+ * age nobody can read never passes any window.
+ */
+function pastWindow(candidate: Candidate, now: number, windowMs: number): boolean {
+  const since =
+    candidate.admittedAt === undefined ? candidate.createdAt : Math.max(candidate.createdAt, candidate.admittedAt)
+  return Number.isFinite(since) && now - since >= windowMs
 }
 
 /** Who an orphan belonged to, for the log line: its agent, and its session leaf for a session pod. */
