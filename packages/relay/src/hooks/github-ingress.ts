@@ -39,12 +39,13 @@ import {
   type RcGithubInstallation,
   type RcHookAssign,
   type RcRunReport,
+  type RdHookNotice,
   type RdMsgHook
 } from '@agentconnect.md/protocol'
 import type { RelayDaemonServer } from '../relay-daemon-server.js'
 import type { HookTable } from './hook-table.js'
 import type { HookRateLimiter } from './rate-limit.js'
-import { dispatchHookFire } from './ingress.js'
+import { dispatchHookFire, noticeDelivery } from './ingress.js'
 import { hookSnapshotForDelivery } from './hook-snapshot.js'
 import { verifySha256Header } from './signature.js'
 import { labelFilterAdmits } from './label-filter.js'
@@ -1121,7 +1122,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       const fallbackSessionKeyPrefix = payload.repository?.full_name ?? String(repoId)
       const firedAt = new Date(deps.clock.now()).toISOString()
 
-      const dispatchRule = (rule: RcHookAssign, prAuthorAuthorized = false): void => {
+      const dispatchRule = (rule: RcHookAssign, prAuthorAuthorized = false, notice?: RdHookNotice): void => {
         // Post-match per-hook budget: a drop is a skip + metadata log, never a 429
         // (GitHub treats non-2xx as a dead delivery) and never a run row (a storm
         // must not flood hook_run).
@@ -1144,7 +1145,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
           context,
           ...(rule.target ? { target: rule.target } : {})
         }
-        if (!cleanupEvent && pullRequestNeedsMaintainer(ctx, prAuthorAuthorized)) {
+        if (!cleanupEvent && notice === undefined && pullRequestNeedsMaintainer(ctx, prAuthorAuthorized)) {
           // No third-party-authored PR lifecycle payload reaches the daemon.
           // Revision events still create a durable, actionable informational
           // Check so a maintainer can request the first review explicitly.
@@ -1161,9 +1162,11 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         void dispatchHookFire(
           { table: deps.table, daemons: deps.daemons, report: deps.report, clock: deps.clock, log: deps.log },
           rule,
-          msg
+          notice ? noticeDelivery(msg, notice) : msg
         )
-        deps.log.info(`github ingress: queued ${rule.hookId}:${deliveryKey} (${ctx.eventAction} ${msg.sessionKey})`)
+        deps.log.info(
+          `github ingress: queued ${notice ?? ''}${notice ? ' ' : ''}${rule.hookId}:${deliveryKey} (${ctx.eventAction} ${msg.sessionKey})`
+        )
       }
 
       if (cleanupEvent) {
@@ -1270,12 +1273,23 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
             : {})
         }
         let allowed = false
+        // Only the CP's own `false` is a verdict on the actor. A timeout, a transient failure or
+        // an older peer leaves `allowed` false too, and none of those may tell anyone they were
+        // refused — least of all a maintainer whose lookup merely failed.
+        let refused = false
         try {
           allowed = await deps.authorizeComment(authzRequest)
+          refused = !allowed
         } catch (err) {
           // Rolling upgrade against an old CP (UNKNOWN_FRAME), timeout, and
           // transient CP/GitHub failures all fail closed.
           deps.log.warn(`github ingress: authz failed ${representative.hookId}:${deliveryKey}: ${String(err)}`)
+        }
+        // An explicit @-mention by an actor the CP did not admit gets one fixed-text reply on its
+        // thread — the daemon tells a thread once — so the silence is explained. Anything less
+        // deliberate than a mention stays silent, and the reply carries nothing the actor wrote.
+        if (refused && fanout.some((rule) => githubRuleIsSummoned(rule, ctx))) {
+          dispatchRule(representative, false, 'actor_not_trusted')
         }
         // A silent skip is indistinguishable from "GitHub never delivered it" without this line.
         if (!allowed && onDenied === 'skip') {

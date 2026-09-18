@@ -34,12 +34,14 @@ import {
   hookSubjectSessionKey,
   pickCodeHostHookMembers,
   RD_GITHUB_THREAD_WORKTREE_CLEANUP_V2,
+  RD_HOOK_NOTICE_V1,
   type CodeHostHookMetadata,
   type CodeHostHookRule,
   type CodeHostProvider,
   type GithubHookMetadata,
   type RcHookAssign,
   type RcRunReport,
+  type RdHookNotice,
   type RdMsgHook
 } from '@agentconnect.md/protocol'
 import type { RelayDaemonServer } from '../relay-daemon-server.js'
@@ -169,6 +171,52 @@ function retryRuleIsAuthorized(captured: RcHookAssign, current: RcHookAssign): b
   return isDeepStrictEqual(capturedAuthority, currentAuthority)
 }
 
+/**
+ * Turn an ordinary hook delivery into the body-free notice variant: the thread and
+ * trusted metadata stay, everything the actor wrote goes, and the delivery key gains a
+ * suffix so its run row never collides with the turn this actor was refused. The notice
+ * is a fixed daemon-authored post; nothing on this wire becomes model input.
+ */
+export function noticeDelivery(msg: RdMsgHook, notice: RdHookNotice): RdMsgHook {
+  const deliveryKey = `${msg.deliveryKey}:notice`
+  // The hook config snapshot is what lets a run project a Check, note or status, and the event is
+  // what classifies it as a revision — a notice must never do either, so it carries no snapshot
+  // and names itself, not the revision the actor was refused on. The provider member stays: it
+  // is how the daemon finds the thread to post on.
+  const {
+    context,
+    configRevision: _configRevision,
+    dispatchRevision: _dispatchRevision,
+    dispatchDaemonId: _dispatchDaemonId,
+    reviewPolicy: _reviewPolicy,
+    reportingMode: _reportingMode,
+    gateMode: _gateMode,
+    ...rest
+  } = msg
+  return {
+    ...rest,
+    deliveryKey,
+    msgId: `${msg.hookId}:${deliveryKey}`,
+    event: `notice:${notice}`,
+    ...(context ? { context: withoutAuthoredText(context) } : {}),
+    notice
+  }
+}
+
+/** The envelope minus every field an actor authored or is identified by; what stays names the thread. */
+function withoutAuthoredText(context: NonNullable<RdMsgHook['context']>): NonNullable<RdMsgHook['context']> {
+  const {
+    bodyExcerpt: _excerpt,
+    body: _body,
+    title: _title,
+    senderLogin: _sender,
+    senderAvatarUrl: _avatar,
+    authorAssociation: _association,
+    ...bare
+  } = context
+  return bare
+}
+
 /** Replace the rolling snapshot as one unit. Deleting first is important: a
  * newly incomplete rule must not inherit optional fence fields from the first
  * attempt when the stable message fields are spread. */
@@ -180,6 +228,8 @@ function messageForRetry(rule: RcHookAssign, msg: RdMsgHook): RdMsgHook {
   delete stable.reviewPolicy
   delete stable.reportingMode
   delete stable.gateMode
+  // A notice never regains the snapshot a retry would otherwise refresh: without one, nothing can project it.
+  if (msg.notice !== undefined) return { ...stable, agentId: rule.agentId }
   return {
     ...stable,
     agentId: rule.agentId,
@@ -188,15 +238,20 @@ function messageForRetry(rule: RcHookAssign, msg: RdMsgHook): RdMsgHook {
 }
 
 function reportBase(rule: RcHookAssign, msg: RdMsgHook): Omit<RcRunReport, 'status' | 'reason'> {
+  // A notice run's row must be inert to every code-host projection: no snapshot (nothing may
+  // project without one) and no subject metadata (no pull number, revision or head for a Check,
+  // note or status repair to key it by), so it can never displace the actionable state the
+  // refused revision itself left behind.
+  const notice = msg.notice !== undefined
   return {
     hookId: rule.hookId,
     deliveryKey: msg.deliveryKey,
     firedAt: msg.firedAt,
     agentId: rule.agentId,
     daemonId: rule.daemonId,
-    ...hookSnapshotForDelivery(rule),
+    ...(notice ? {} : hookSnapshotForDelivery(rule)),
     ...(msg.event ? { event: msg.event } : {}),
-    ...pickCodeHostHookMembers(msg)
+    ...(notice ? {} : pickCodeHostHookMembers(msg))
   }
 }
 
@@ -238,7 +293,12 @@ export async function dispatchHookFire(
 
       // Fenced on the live connection and re-read on every attempt: an advertisement changes under a standing rule, and a rollout heals without a convergence pass.
       const host = codeHostHookMetadataOf(dispatchMsg)
-      const required = host ? requiredDaemonFeatures(host, dispatchMsg.event) : []
+      const required = [
+        ...(host ? requiredDaemonFeatures(host, dispatchMsg.event) : []),
+        // A daemon without the notice slice would run this as an ordinary prompt — for the
+        // very actor it was refused as. Host-neutral, because the post is.
+        ...(dispatchMsg.notice !== undefined ? [RD_HOOK_NOTICE_V1] : [])
+      ]
       if (required.some((feature) => !conn.supports(feature))) {
         deps.report({ ...base, status: 'failed', reason: 'rejected:unsupported' })
         resolve()

@@ -20,12 +20,13 @@ import {
   type RcCodeHostMembershipAuthz,
   type RcHookAssign,
   type RcRunReport,
+  type RdHookNotice,
   type RdMsgHook
 } from '@agentconnect.md/protocol'
 import type { RelayDaemonServer } from '../relay-daemon-server.js'
 import type { HookTable } from './hook-table.js'
 import type { HookRateLimiter } from './rate-limit.js'
-import { dispatchHookFire } from './ingress.js'
+import { dispatchHookFire, noticeDelivery } from './ingress.js'
 import { hookSnapshotForDelivery } from './hook-snapshot.js'
 import { mentionsGithubHandle, truncateUtf8, GITHUB_BODY_EXCERPT_MAX } from './github-ingress.js'
 import { labelFilterAdmits } from './label-filter.js'
@@ -528,7 +529,7 @@ export function registerGitlabIngress(app: FastifyInstance, deps: GitlabIngressD
       if (!ctx) return reply.code(202).send({ deliveryKey })
       const context = buildGitlabContext(payload, ctx)
 
-      const dispatchRule = (rule: RcHookAssign): void => {
+      const dispatchRule = (rule: RcHookAssign, notice?: RdHookNotice): void => {
         if (!deps.limiter.allow(rule.hookId)) {
           deps.log.info(`gitlab ingress: rate-limited ${rule.hookId}:${deliveryKey} (${ctx.eventAction})`)
           return
@@ -555,9 +556,11 @@ export function registerGitlabIngress(app: FastifyInstance, deps: GitlabIngressD
         void dispatchHookFire(
           { table: deps.table, daemons: deps.daemons, report: deps.report, clock: deps.clock, log: deps.log },
           rule,
-          msg
+          notice ? noticeDelivery(msg, notice) : msg
         )
-        deps.log.info(`gitlab ingress: queued ${rule.hookId}:${deliveryKey} (${ctx.eventAction} ${msg.sessionKey})`)
+        deps.log.info(
+          `gitlab ingress: queued ${notice ?? ''}${notice ? ' ' : ''}${rule.hookId}:${deliveryKey} (${ctx.eventAction} ${msg.sessionKey})`
+        )
       }
 
       const reportReviewRequestRequired = (rule: RcHookAssign): void => {
@@ -645,8 +648,12 @@ export function registerGitlabIngress(app: FastifyInstance, deps: GitlabIngressD
             : {})
         }
         let allowed = false
+        // Only the CP's own `false` is a verdict on the actor; an operational failure leaves
+        // `allowed` false too and earns nobody a notice.
+        let refused = false
         try {
           allowed = await deps.authorizeMembership(request)
+          refused = !allowed
         } catch (err) {
           // Rolling upgrade against an older CP (UNKNOWN_FRAME), timeout, and
           // transient failures all fail closed (§12.2).
@@ -656,6 +663,11 @@ export function registerGitlabIngress(app: FastifyInstance, deps: GitlabIngressD
           deps.log.info(
             `gitlab ingress: authz denied ${representative.hookId}:${deliveryKey} (${ctx.eventAction} actor ${actorId})`
           )
+          // An explicit @-mention by an actor the CP did not admit gets one fixed-text reply on its
+          // thread — the daemon tells a thread once — so the silence is explained. Anything less
+          // deliberate than a mention stays silent, and the reply carries nothing the actor wrote.
+          if (refused && fanout.some((rule) => gitlabRuleIsSummoned(rule, ctx)))
+            dispatchRule(representative, 'actor_not_trusted')
           if (onDenied === 'request-review') for (const rule of fanout) reportReviewRequestRequired(rule)
           return
         }
