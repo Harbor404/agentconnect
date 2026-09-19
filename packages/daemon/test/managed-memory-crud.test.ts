@@ -247,7 +247,7 @@ describe('common managed entry mutations', () => {
     ).rejects.toMatchObject({ code: 'TOO_LARGE' })
     expect(f.commits).toHaveLength(1)
   })
-  it('does not advertise conditional writes on a native-writable filesystem even for an authorized caller', async () => {
+  it('serves last-write-wins mutations on a native-writable filesystem through the compatibility writer', async () => {
     const f = await fixture()
     const local = new LocalMemoryFs(f.fs.root)
     const api = await createMemoryEntryService({
@@ -257,9 +257,209 @@ describe('common managed entry mutations', () => {
       canRead: () => true,
       write: { source: 'console', canWrite: () => true }
     })
-    expect((await api.describe()).operations).toEqual(['list', 'get', 'search', 'history'])
-    await expect(api.create({ label: 'topic', text: 'new' })).rejects.toMatchObject({ code: 'UNSUPPORTED' })
+    // Not conditional: the check is the writer's own, strong against daemon-side writers, best-effort otherwise.
+    expect(await api.describe()).toMatchObject({
+      operations: ['list', 'get', 'search', 'create', 'update', 'delete', 'history'],
+      writeConsistency: 'last-write-wins',
+      exactCreate: true,
+      exactEdit: true
+    })
+    const created = await api.create({ label: 'topic', text: '---\ndescription: deployment\n---\n\nOriginal' })
+    expect(created.state).toBe('completed')
+    const stored = (await local.readFile('memory/topic.md'))!.content
+    expect(stored).toContain('name: topic')
+    expect(stored).toContain('Original')
+    expect((await local.readFile('memory/MEMORY.md'))!.content).toContain('[topic](topic.md) — deployment')
+    expect((await api.get({ ref: created.entry!.ref }))!.entry.revision).toBe(created.entry!.revision)
+    await expect(api.create({ label: 'topic', text: 'again' })).rejects.toMatchObject({ code: 'CONFLICT' })
+    const updated = await api.update({
+      ref: created.entry!.ref,
+      revision: created.entry!.revision,
+      edit: { oldText: 'Original', newText: 'Corrected' }
+    })
+    expect((await local.readFile('memory/topic.md'))!.content).toContain('Corrected')
+    await expect(
+      api.update({ ref: updated.entry!.ref, revision: created.entry!.revision, text: 'stale' })
+    ).rejects.toMatchObject({ code: 'CONFLICT', currentRevision: updated.entry!.revision })
+    // As advertised, a write without a revision simply lands.
+    const blind = await api.update({ ref: updated.entry!.ref, text: 'Replaced without a revision' })
+    expect((await local.readFile('memory/topic.md'))!.content).toContain('Replaced without a revision')
+    // The sidecar carries every write; no transaction, so the log follows the write rather than joining it.
+    const log = await api.history({ ref: blind.entry!.ref, limit: 5 })
+    expect(log.events.map((event) => event.kind)).toEqual(['update', 'update', 'create'])
+    expect(log.events[0]!.source).toBe('console')
+    const removed = await api.delete({ ref: blind.entry!.ref, revision: blind.entry!.revision })
+    expect(removed.deletedRef).toBe(blind.entry!.ref)
     expect(await local.readFile('memory/topic.md')).toBeNull()
+    expect((await local.readFile('memory/MEMORY.md'))!.content).not.toContain('[topic]')
+    await expect(api.update({ ref: blind.entry!.ref, text: 'revive' })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    expect(f.commits).toHaveLength(0)
+  })
+
+  it('refuses a filesystem write when the file changed under the lock, and never touches the index for it', async () => {
+    const f = await fixture()
+    const base = new LocalMemoryFs(f.fs.root)
+    // An out-of-band editor lands right after every read of the topic while armed, so whichever read the writer takes
+    // as its precondition is stale by the time it replaces or unlinks: the mtime guard must refuse.
+    let intrude: (() => Promise<void>) | undefined
+    const local: MemoryFs = {
+      key: base.key,
+      root: base.root,
+      subdir: base.subdir.bind(base),
+      readFile: async (rel, encoding) => {
+        const file = await base.readFile(rel, encoding)
+        if (intrude && rel === 'memory/topic.md') await intrude()
+        return file
+      },
+      writeFile: base.writeFile.bind(base),
+      readdir: base.readdir.bind(base),
+      mkdir: base.mkdir.bind(base),
+      rename: base.rename.bind(base),
+      rm: base.rm.bind(base),
+      rmIfMatch: base.rmIfMatch.bind(base),
+      utimes: base.utimes.bind(base)
+    }
+    const api = await createMemoryEntryService({
+      provider: new ManagedMemoryProvider(() => localMemoryHome(local)),
+      store: f.db,
+      scope: { agentId: 'agent' },
+      canRead: () => true,
+      write: { source: 'tool', canWrite: () => true }
+    })
+    const created = await api.create({ label: 'topic', text: 'first' })
+    // Each intrusion leaves a distinct mtime, so a guard that compared against the previous intrusion would still miss.
+    let intrusions = 0
+    const replaceUnderneath = async () => {
+      await base.writeFile('memory/topic.md', (await base.readFile('memory/topic.md'))!.content)
+      await base.utimes('memory/topic.md', new Date(Date.UTC(2020, 0, 1, 0, 0, ++intrusions)).toISOString())
+    }
+    intrude = replaceUnderneath
+    await expect(
+      api.update({ ref: created.entry!.ref, revision: created.entry!.revision, text: 'second' })
+    ).rejects.toMatchObject({ code: 'CONFLICT' })
+    intrude = undefined
+    expect((await base.readFile('memory/topic.md'))!.content).not.toContain('second')
+    // The same gap before a delete: the newer file stays, and the mutation is refused rather than reported complete.
+    const fresh = (await api.get({ ref: created.entry!.ref }))!.entry
+    intrude = replaceUnderneath
+    await expect(api.delete({ ref: fresh.ref, revision: fresh.revision })).rejects.toMatchObject({ code: 'CONFLICT' })
+    intrude = undefined
+    expect((await base.readFile('memory/topic.md'))!.content).toContain('first')
+  })
+
+  it('reports a failure after dispatch as unconfirmed, and one the port refuses before publishing by its own code', async () => {
+    const f = await fixture()
+    const base = new LocalMemoryFs(f.fs.root)
+    let lostReply = false
+    let breakIndex = false
+    const local: MemoryFs = {
+      key: base.key,
+      root: base.root,
+      subdir: base.subdir.bind(base),
+      readFile: base.readFile.bind(base),
+      // A shim or older peer can apply the commit and lose the reply: the write lands, the caller sees an error.
+      writeFile: async (rel, content, options) => {
+        const stat = await base.writeFile(rel, content, options)
+        if (lostReply && rel === 'memory/topic.md') throw new Error('channel closed before the reply')
+        return stat
+      },
+      // The index regeneration lists the directory after the file already changed.
+      readdir: async (rel) => {
+        if (breakIndex) throw new Error('listing failed')
+        return base.readdir(rel)
+      },
+      mkdir: base.mkdir.bind(base),
+      rename: base.rename.bind(base),
+      rm: base.rm.bind(base),
+      rmIfMatch: base.rmIfMatch.bind(base),
+      utimes: base.utimes.bind(base)
+    }
+    const api = await createMemoryEntryService({
+      provider: new ManagedMemoryProvider(() => localMemoryHome(local)),
+      store: f.db,
+      scope: { agentId: 'agent' },
+      canRead: () => true,
+      write: { source: 'console', canWrite: () => true }
+    })
+    const created = await api.create({ label: 'topic', text: 'first' })
+    lostReply = true
+    await expect(api.update({ ref: created.entry!.ref, text: 'second' })).rejects.toMatchObject({
+      code: 'AMBIGUOUS_WRITE'
+    })
+    lostReply = false
+    expect((await base.readFile('memory/topic.md'))!.content).toContain('second')
+    // The revision the caller held is stale now, so a replay with it is refused instead of clobbering the write.
+    await expect(
+      api.update({ ref: created.entry!.ref, revision: created.entry!.revision, text: 'replay' })
+    ).rejects.toMatchObject({ code: 'CONFLICT' })
+    const fresh = (await api.get({ ref: created.entry!.ref }))!.entry
+    breakIndex = true
+    await expect(api.update({ ref: fresh.ref, revision: fresh.revision, text: 'third' })).rejects.toMatchObject({
+      code: 'AMBIGUOUS_WRITE'
+    })
+    breakIndex = false
+    expect((await base.readFile('memory/topic.md'))!.content).toContain('third')
+    // A precondition the port itself refuses is proven unapplied, on either side of the dispatch.
+    await expect(api.update({ ref: fresh.ref, revision: fresh.revision, text: 'stale' })).rejects.toMatchObject({
+      code: 'CONFLICT'
+    })
+    await expect(api.create({ label: '../escape', text: 'x' })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+  })
+
+  it('advertises delete on a native-writable home only when it can verify the file before removing it', async () => {
+    const f = await fixture()
+    const base = new LocalMemoryFs(f.fs.root)
+    // A home whose port cannot check the file before unlinking (a shim or an older peer): create and update, no delete.
+    const unverified: MemoryFs = {
+      key: base.key,
+      root: base.root,
+      subdir: base.subdir.bind(base),
+      readFile: base.readFile.bind(base),
+      writeFile: base.writeFile.bind(base),
+      readdir: base.readdir.bind(base),
+      mkdir: base.mkdir.bind(base),
+      rename: base.rename.bind(base),
+      rm: base.rm.bind(base),
+      utimes: base.utimes.bind(base)
+    }
+    const api = await createMemoryEntryService({
+      provider: new ManagedMemoryProvider(() => localMemoryHome(unverified)),
+      store: f.db,
+      scope: { agentId: 'agent' },
+      canRead: () => true,
+      write: { source: 'console', canWrite: () => true }
+    })
+    expect((await api.describe()).operations).toEqual(['list', 'get', 'search', 'create', 'update', 'history'])
+    const created = await api.create({ label: 'topic', text: 'kept' })
+    await expect(api.delete({ ref: created.entry!.ref, revision: created.entry!.revision })).rejects.toMatchObject({
+      code: 'UNSUPPORTED'
+    })
+    expect((await base.readFile('memory/topic.md'))!.content).toContain('kept')
+  })
+
+  it('keeps channel overlay rules on a native-writable filesystem', async () => {
+    const f = await fixture()
+    const local = new LocalMemoryFs(f.fs.root)
+    const provider = new ManagedMemoryProvider(() => localMemoryHome(local))
+    const service = (channelKey?: string) =>
+      createMemoryEntryService({
+        provider,
+        store: f.db,
+        scope: { agentId: 'agent', channelKey },
+        canRead: () => true,
+        write: { source: 'tool', canWrite: () => true }
+      })
+    const base = await service()
+    await base.create({ label: 'topic', text: 'base' })
+    const channel = await service(memoryChannelKey('room'))
+    const inherited = (await channel.list()).entries[0]!
+    await expect(
+      channel.update({ ref: inherited.ref, revision: inherited.revision, text: 'damage' })
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    const override = await channel.create({ label: 'topic', text: 'channel' })
+    expect((await local.readFile('memory/topic.md'))!.content).toContain('base')
+    await channel.delete({ ref: override.entry!.ref, revision: override.entry!.revision })
+    expect((await channel.list()).entries[0]!.origin).toBe('inherited')
   })
 })
 

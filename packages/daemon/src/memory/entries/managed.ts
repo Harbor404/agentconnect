@@ -1,4 +1,5 @@
-import { mutateManagedMemoryEntry, type ManagedEntryMutation } from './writer.js'
+import { mutateManagedMemoryEntry, mutateManagedMemoryEntryOnFilesystem, type ManagedEntryMutation } from './writer.js'
+import { sidecarMemoryHistory } from '../home.js'
 import type { MemoryWriteSource } from '../store.js'
 import { randomUUID } from 'node:crypto'
 import type {
@@ -98,11 +99,23 @@ export class ManagedMemoryEntries implements MemoryEntriesView {
   ) {
     if (roots.length < 1 || roots.length > 2) throw new Error('managed memory requires one root or an overlay')
     this.identity = memoryDigest(['managed', bindingGeneration, roots.map((root) => root.key)])
-    if (writeContext && roots[0]!.atomicTransaction && roots[0]!.stageTransactionFile && roots[0]!.captureStatus) {
+    // Every writable home serves the mutations, but only a transactional home may call them conditional: any other
+    // gets the compatibility writer's last-write-wins (writer.ts), with delete only where the port verifies before it
+    // unlinks. Exact create (an exclusive publish) and exact edit (one literal match) hold on both.
+    if (writeContext) {
+      const root = roots[0]!
+      const transactional = !!(root.atomicTransaction && root.stageTransactionFile && root.captureStatus)
       this.capabilities = {
         ...this.capabilities,
-        operations: ['list', 'get', 'search', 'create', 'update', 'delete'],
-        writeConsistency: 'conditional',
+        operations: [
+          'list',
+          'get',
+          'search',
+          'create',
+          'update',
+          ...(transactional || root.rmIfMatch ? (['delete'] as const) : [])
+        ],
+        writeConsistency: transactional ? 'conditional' : 'last-write-wins',
         exactCreate: true,
         exactEdit: true
       }
@@ -311,7 +324,8 @@ export class ManagedMemoryEntries implements MemoryEntriesView {
       | Omit<Extract<MemoryEntryUpdateRequest, { edit: unknown }>, 'ref'>
   ) {
     this.writableCoordinate(coordinate)
-    if (!request.revision) throw new MemoryEntriesError('INVALID_ARGUMENT', 'managed update requires a revision')
+    if (!request.revision && this.capabilities.writeConsistency === 'conditional')
+      throw new MemoryEntriesError('INVALID_ARGUMENT', 'managed update requires a revision')
     if (request.metadata !== undefined)
       throw new MemoryEntriesError('UNSUPPORTED', 'managed metadata belongs in Markdown frontmatter')
     return this.mutate(
@@ -324,7 +338,8 @@ export class ManagedMemoryEntries implements MemoryEntriesView {
 
   async delete(coordinate: EntryCoordinate, request: { revision?: string }) {
     this.writableCoordinate(coordinate)
-    if (!request.revision) throw new MemoryEntriesError('INVALID_ARGUMENT', 'managed delete requires a revision')
+    if (!request.revision && this.capabilities.writeConsistency === 'conditional')
+      throw new MemoryEntriesError('INVALID_ARGUMENT', 'managed delete requires a revision')
     return this.mutate(coordinate.id, { operation: 'delete', revision: request.revision })
   }
 
@@ -336,7 +351,17 @@ export class ManagedMemoryEntries implements MemoryEntriesView {
   private async mutate(topic: string, mutation: ManagedEntryMutation) {
     if (!this.writeContext || !this.capabilities.operations.includes(mutation.operation))
       throw new MemoryEntriesError('UNSUPPORTED', 'memory entry mutations are unavailable')
-    const result = await mutateManagedMemoryEntry(this.roots[0]!, topic, mutation, this.writeContext)
+    const root = this.roots[0]!
+    const result =
+      root.atomicTransaction && root.stageTransactionFile && root.captureStatus
+        ? await mutateManagedMemoryEntry(root, topic, mutation, this.writeContext)
+        : await mutateManagedMemoryEntryOnFilesystem(
+            root,
+            topic,
+            mutation,
+            this.writeContext,
+            this.historyFor?.(root) ?? sidecarMemoryHistory(root)
+          )
     const file = result.receipt.files.find((entry) => entry.path === topic)!
     const header = result.content === null ? undefined : parseMemoryFrontmatter(result.content).header
     return {
