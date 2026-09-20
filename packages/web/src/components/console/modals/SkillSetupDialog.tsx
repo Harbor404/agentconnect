@@ -12,6 +12,7 @@ import { fetchAgentDto, type SkillSourceDto } from '@/lib/api'
 import { InstallRegistrySkillModal } from '@/components/console/InstallRegistrySkillModal'
 import { CreateSkillSourceModal } from '@/components/console/SkillSourcesCard'
 import { NativeDialogNotice } from './NativeDialogNotice'
+import { nativeFailureReport, type NativeDialogReport } from './native-dialog-report'
 
 type SkillSetupUi = Extract<NativeMcpUi, { resourceUri: typeof SKILL_SETUP_URI }>
 
@@ -24,7 +25,7 @@ export default function SkillSetupDialog({
 }: {
   ui: SkillSetupUi
   onClose: () => void
-  onCompleted: (summary: string) => void
+  onCompleted: NativeDialogReport
 }) {
   const { activeOrg, myRole } = useOrgs()
   const { agents, skillSources, updateAgent } = useConsoleData()
@@ -56,14 +57,18 @@ export default function SkillSetupDialog({
   }
   const onCreated = (created: SkillSourceDto) => void installed(created)
 
+  // A refused install is reported too: the caller asked for a skill and has to hear that it has none.
+  const onFailed = nativeFailureReport('Installing the skill', onCompleted, onClose)
+
   return ui.intent.source === 'git' ? (
-    <CreateSkillSourceModal onClose={onClose} onCreated={onCreated} />
+    <CreateSkillSourceModal onClose={onClose} onCreated={onCreated} onFailed={onFailed} />
   ) : (
     <InstallRegistrySkillModal
       existing={skillSources}
       initialQuery={ui.intent.query}
       onClose={onClose}
       onCreated={onCreated}
+      onFailed={onFailed}
     />
   )
 }
