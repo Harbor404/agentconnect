@@ -24,6 +24,7 @@ const app = (): NonNullable<SessionStep['app']> => ({
   }
 })
 beforeEach(() => {
+  localStorage.clear()
   modal.openNativeIntegration.mockClear()
   modal.closeNativeIntegration.mockClear()
   element = document.createElement('div')
@@ -38,16 +39,20 @@ afterEach(() => {
 describe('native integration UI', () => {
   it('keeps a persisted card reopenable after a refresh without reopening the dialog automatically', async () => {
     const value = app()
-    const onRpc = vi.fn(async () => ({ ok: true as const, result: {} }))
+    const onReport = vi.fn(() => true)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: value }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
     })
     act(() => root.unmount())
+    // A RELOAD, not a remount: the module's in-memory card state goes with the page, and only
+    // `sessionStorage` survives to say this card already had its one automatic opening.
+    vi.resetModules()
+    const { McpAppCard: Reloaded } = await import('./McpAppCard')
     root = createRoot(element)
     const restored = mcpAppCard(JSON.stringify(value))!
     expect(restored.nativeUi).toEqual(value.nativeUi)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: restored }} onRpc={onRpc} />)
+      root.render(<Reloaded step={{ app: restored }} onReport={onReport} />)
     })
     expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
     expect(element.querySelector('iframe')).toBeNull()
@@ -61,13 +66,13 @@ describe('native integration UI', () => {
   it('waits for an explicit click when another dialog is open', async () => {
     modal.openNativeIntegration.mockReturnValueOnce(false)
     const value = app()
-    const onRpc = vi.fn(async () => ({ ok: true as const, result: {} }))
+    const onReport = vi.fn(() => true)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: value }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
     })
     expect(element.textContent).toContain('Close the current dialog')
     await act(async () => {
-      root.render(<McpAppCard step={{ app: { ...value } }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: { ...value } }} onReport={onReport} />)
     })
     expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
     await act(async () => {
@@ -77,37 +82,37 @@ describe('native integration UI', () => {
   })
   it('closes an expired dialog but leaves a completed one available for its final reveal step', async () => {
     const value = app()
-    const onRpc = vi.fn(async () => ({ ok: true as const, result: {} }))
+    const onReport = vi.fn(() => true)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: value }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
     })
     await act(async () => {
-      root.render(<McpAppCard step={{ app: { ...value, outcome: 'completed' } }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: { ...value, outcome: 'completed' } }} onReport={onReport} />)
     })
     expect(modal.closeNativeIntegration).not.toHaveBeenCalled()
     await act(async () => {
-      root.render(<McpAppCard step={{ app: { ...value, outcome: 'expired' } }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: { ...value, outcome: 'expired' } }} onReport={onReport} />)
     })
     expect(modal.closeNativeIntegration).toHaveBeenCalledWith(value.appId)
   })
   it('opens a native dialog once without an iframe or a second MCP call', async () => {
     const value = app()
-    const onRpc = vi.fn(async () => ({ ok: true as const, result: {} }))
+    const onReport = vi.fn(() => true)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: value }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
     })
     expect(element.querySelector('iframe')).toBeNull()
-    expect(onRpc).not.toHaveBeenCalled()
+    expect(onReport).not.toHaveBeenCalled()
     expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: { ...value } }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: { ...value } }} onReport={onReport} />)
     })
     expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
   })
   it('does not open a settled request or a history card by itself, but still offers the way back', async () => {
     const settled = { ...app(), outcome: 'expired' as const }
     await act(async () => {
-      root.render(<McpAppCard step={{ app: settled }} onRpc={async () => ({ ok: true, result: {} })} />)
+      root.render(<McpAppCard step={{ app: settled }} onReport={() => true} />)
     })
     expect(modal.openNativeIntegration).not.toHaveBeenCalled()
     // Opening needs no bridge — a dialog the reader cannot reach again is the bug this guards.
@@ -126,12 +131,12 @@ describe('native integration UI', () => {
 
   it('reopens a completed card and says plainly when the agent can no longer be told', async () => {
     const value = app()
-    const onRpc = vi.fn(async () => ({ ok: true as const, result: {} }))
+    const onReport = vi.fn(() => true)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: value }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
     })
     await act(async () => {
-      root.render(<McpAppCard step={{ app: { ...value, outcome: 'completed' } }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: { ...value, outcome: 'completed' } }} onReport={onReport} />)
     })
     expect(element.textContent).toContain('Open again')
     await act(async () => element.querySelector('button')!.click())
@@ -139,17 +144,17 @@ describe('native integration UI', () => {
     const completed = (modal.openNativeIntegration.mock.calls[1] as unknown as [unknown, (text: string) => void])[1]
     await act(async () => completed('Reviewed the code host connections.'))
     // The saves already applied under the reader's own Console session; only the note is missing.
-    expect(onRpc).not.toHaveBeenCalled()
+    expect(onReport).not.toHaveBeenCalled()
     expect(element.textContent).toContain('the agent was not notified')
   })
   it('never calls a refused submit a save, even when the agent cannot be told', async () => {
     const value = app()
-    const onRpc = vi.fn(async () => ({ ok: true as const, result: {} }))
+    const onReport = vi.fn(() => true)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: value }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
     })
     await act(async () => {
-      root.render(<McpAppCard step={{ app: { ...value, outcome: 'completed' } }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: { ...value, outcome: 'completed' } }} onReport={onReport} />)
     })
     await act(async () => element.querySelector('button')!.click())
     const completed = (
@@ -164,18 +169,137 @@ describe('native integration UI', () => {
     expect(element.textContent).toContain('the agent was not told')
   })
 
-  it('reports successful completion once and never reports opening as creation', async () => {
-    const onRpc = vi.fn(async () => ({ ok: true as const, result: {} }))
+  // The transcript re-keys a turn when its live steps become persisted rows, so the card under an
+  // open dialog is remounted rather than re-rendered. The dialog goes back, and — the bug this
+  // guards — the form the reader then submits still reaches the conversation.
+  it('puts the dialog back when the card is remounted under it, and still reports', async () => {
+    const value = app()
+    const onReport = vi.fn(() => true)
     await act(async () => {
-      root.render(<McpAppCard step={{ app: app() }} onRpc={onRpc} />)
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
     })
-    expect(onRpc).not.toHaveBeenCalled()
+    expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
+    act(() => root.unmount())
+    root = createRoot(element)
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: { ...value } }} onReport={onReport} />)
+    })
+    expect(modal.openNativeIntegration).toHaveBeenCalledTimes(2)
+    const completed = (modal.openNativeIntegration.mock.calls[1] as unknown as [unknown, (text: string) => void])[1]
+    await act(async () => completed('Created agent example-qa (agentId 11111111-1111-4111-8111-111111111111).'))
+    expect(onReport).toHaveBeenCalledWith('Created agent example-qa (agentId 11111111-1111-4111-8111-111111111111).')
+    expect(element.textContent).not.toContain('could not be notified')
+  })
+
+  // Accepting a turn is not delivering one — it can still be queued where the reader may cancel it
+  // — so a delivered report settles nothing. It only stops ANOTHER TAB, which has its own
+  // `sessionStorage`, from opening a dialog over a form that was already submitted.
+  it('records a delivered report for other tabs without settling the card', async () => {
+    const value = app()
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: value }} onReport={() => true} />)
+    })
+    const landed = (modal.openNativeIntegration.mock.calls[0] as unknown as [unknown, (text: string) => void])[1]
+    await act(async () => landed('Created GitHub subscription.'))
+    vi.resetModules()
+    const { McpAppCard: OtherTab } = await import('./McpAppCard')
+    modal.openNativeIntegration.mockClear()
+    root = createRoot(document.body.appendChild(document.createElement('div')))
+    await act(async () => {
+      root.render(<OtherTab step={{ app: { ...value } }} onReport={() => true} />)
+    })
+    expect(modal.openNativeIntegration).not.toHaveBeenCalled()
+    expect(element.textContent).toContain('Created GitHub subscription.')
+  })
+
+  it('records nothing when the conversation would not take the report', async () => {
+    const value = app()
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: value }} onReport={() => false} />)
+    })
+    const dropped = (modal.openNativeIntegration.mock.calls[0] as unknown as [unknown, (text: string) => void])[1]
+    await act(async () => dropped('Created GitHub subscription.'))
+    expect(localStorage.getItem(`ac.native-ui.reported.${value.appId}`)).toBeNull()
+  })
+
+  // A settlement arriving after the dialog reported must not shut the reveal step that dialog kept.
+  it('does not close a reported dialog when its card then settles', async () => {
+    const value = app()
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: value }} onReport={() => true} />)
+    })
+    const completed = (modal.openNativeIntegration.mock.calls[0] as unknown as [unknown, (text: string) => void])[1]
+    await act(async () => completed('Created webhook integration.'))
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: { ...value, outcome: 'closed' } }} onReport={() => true} />)
+    })
+    expect(modal.closeNativeIntegration).not.toHaveBeenCalled()
+  })
+
+  // Navigating away unmounts the card with its dialog still open, exactly as a remount does — but
+  // coming back later is not the same commit, and the reader who left is not asking for the form
+  // to be thrown at them again.
+  it('does not reopen a dialog the reader navigated away from', async () => {
+    vi.useFakeTimers()
+    try {
+      const value = app()
+      const onReport = vi.fn(() => true)
+      await act(async () => {
+        root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
+      })
+      expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
+      act(() => root.unmount())
+      vi.advanceTimersByTime(60_000)
+      root = createRoot(element)
+      await act(async () => {
+        root.render(<McpAppCard step={{ app: { ...value } }} onReport={onReport} />)
+      })
+      expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
+      expect(element.textContent).toContain('Open configuration')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // A reader who already submitted says nothing either: the dialog reported and closed itself.
+  it('does not reopen a dialog that already reported', async () => {
+    const value = app()
+    const onReport = vi.fn(() => true)
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: value }} onReport={onReport} />)
+    })
+    const completed = (modal.openNativeIntegration.mock.calls[0] as unknown as [unknown, (text: string) => void])[1]
+    await act(async () => completed('Created GitHub subscription.'))
+    act(() => root.unmount())
+    root = createRoot(element)
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: { ...value } }} onReport={onReport} />)
+    })
+    expect(modal.openNativeIntegration).toHaveBeenCalledTimes(1)
+  })
+
+  it('tells the reader when the conversation would not take the report', async () => {
+    const onReport = vi.fn(() => false)
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: app() }} onReport={onReport} />)
+    })
+    const completed = (modal.openNativeIntegration.mock.calls[0] as unknown as [unknown, (text: string) => void])[1]
+    await act(async () => completed('Created GitHub subscription.'))
+    expect(element.textContent).toContain('Configuration was saved, but the agent could not be notified.')
+  })
+
+  it('reports successful completion once and never reports opening as creation', async () => {
+    const onReport = vi.fn(() => true)
+    await act(async () => {
+      root.render(<McpAppCard step={{ app: app() }} onReport={onReport} />)
+    })
+    expect(onReport).not.toHaveBeenCalled()
     const completed = (modal.openNativeIntegration.mock.calls[0] as unknown as [unknown, (text: string) => void])[1]
     await act(async () => {
       completed('Created GitHub subscription.')
       completed('Created GitHub subscription.')
     })
-    expect(onRpc).toHaveBeenCalledTimes(1)
+    expect(onReport).toHaveBeenCalledTimes(1)
     expect(element.textContent).toContain('Created GitHub subscription.')
   })
 })
