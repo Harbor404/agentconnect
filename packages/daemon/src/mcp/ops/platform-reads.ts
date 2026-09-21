@@ -504,7 +504,17 @@ export async function readAttachment(
 }
 
 /** The session's own conversation, read through the gateway it is already bound to. */
-export async function getCurrentChannel(ctx: SessionContext, gw: MessageGateway): Promise<unknown> {
+export async function getCurrentChannel(
+  ctx: SessionContext,
+  gw: MessageGateway,
+  deliveryThread: string
+): Promise<unknown> {
   const info = await gw.getChannelInfo(ctx.channel).catch(() => undefined)
-  return { channel: ctx.channel, thread: ctx.thread, name: info?.name ?? null, isIm: info?.isIm ?? null }
+  // What the model is told its thread is must be something it can post back to.
+  return {
+    channel: ctx.channel,
+    thread: deliveryThread,
+    name: info?.name ?? null,
+    isIm: info?.isIm ?? null
+  }
 }

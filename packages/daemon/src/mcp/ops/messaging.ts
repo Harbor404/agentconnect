@@ -871,7 +871,10 @@ export async function sendMessage(
   //     activation rendezvous that admits this delivery exactly once (§8.6).
   let wake: MessageAgentResult | undefined
   if (baseWakeReq !== undefined) {
-    const threadForWake = channel !== undefined ? postedThread : ctx.thread
+    // `callerThread` / `originThread` above are SESSION identity — the coordinator feeds them
+    // to `sessionKey()` to recompute `callerKey` and to route a cross-daemon reply — so they
+    // stay on the session coordinate. Only the wake's own thread is a delivery default.
+    const threadForWake = channel !== undefined ? postedThread : (deps.deliveryThreadNow?.(ctx) ?? ctx.deliveryThread)
     wake = await deps.messageAgent({
       ...baseWakeReq,
       ...(threadForWake !== undefined ? { thread: threadForWake } : {}),

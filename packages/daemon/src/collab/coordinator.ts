@@ -2,6 +2,7 @@
 // orchestration, hoisted out of `Daemon` verbatim. Every delivery here is DIRECT (never a
 // visible channel post) and every ordering below — record-first, CAS, admission barrier — is
 // load-bearing against a fast worker replying before its record exists.
+import { isAppendCoordinate } from '../session/append-coordinate.js'
 import type { HostKey } from '../acp/host-key.js'
 import { randomUUID } from 'node:crypto'
 import type { Clock, TimerHandle } from '@agentconnect.md/connection'
@@ -109,6 +110,16 @@ export interface CollabTurnHost {
   ): Promise<string | null>
   webchatTransport(): WebchatTransport
   /** The external audience of a session, by its logical key. */
+  /** The TARGET's session coordinate in this conversation when it differs from the thread
+   *  the wake is delivered on (channel-session-mode.md §3.1). A direct peer wake never
+   *  enters the per-target ingress resolution, so it asks here instead; each agent holds its
+   *  own reservation, so this is the callee's answer, not the caller's. */
+  targetSessionCoordinate(
+    agentId: string,
+    integrationId: string | undefined,
+    channel: string,
+    transportScope?: string
+  ): Promise<string | undefined>
   externalOriginForSession(
     agentId: string,
     sessionKey: string | undefined
@@ -450,7 +461,22 @@ export class CollabCoordinator {
     const event = this.prepareAgentDelivery(req)
     const { deliveryId } = event
     const msgId = `agentcall:${coordChannel}:${deliveryId}`
-    const targetSession = sessionKey(platform, coordChannel, event.thread, req.toAgentId, targetTransportScope)
+    // Keyed on the CALLEE's coordinate where its conversation appends: this path dispatches a
+    // known target directly, so it never reaches the per-target ingress resolution, and
+    // keying on the delivery thread would open the peer a second session per caller.
+    const targetCoordinate = await this.host.targetSessionCoordinate(
+      req.toAgentId,
+      integrationId,
+      coordChannel,
+      targetTransportScope
+    )
+    const targetSession = sessionKey(
+      platform,
+      coordChannel,
+      targetCoordinate ?? event.thread,
+      req.toAgentId,
+      targetTransportScope
+    )
 
     const prior = this.agentCallDeliveries.get(deliveryId)
     if (prior) return observe('collaboration.delivery.deduplicated', prior, deliveryId)
@@ -552,6 +578,7 @@ export class CollabCoordinator {
       platform,
       channel: coordChannel,
       thread: event.thread,
+      ...(targetCoordinate !== undefined ? { sessionThread: targetCoordinate } : {}),
       ...(targetTransportScope !== undefined ? { transportScope: targetTransportScope } : {}),
       sender: { id: req.callerAgentId, isBot: true },
       text: event.text,
@@ -873,7 +900,14 @@ export class CollabCoordinator {
         source: 'agent',
         platform: originPlatform,
         channel: local.channel,
-        ...(local.thread ? { thread: local.thread } : {}),
+        // The stored row's thread is the SESSION's. Where it is synthetic it carries the
+        // session, never the reply target — the resumed parent posts at the channel root
+        // rather than at a thread no platform has (channel-session-mode.md §3.1).
+        ...(isAppendCoordinate(local.thread)
+          ? { sessionThread: local.thread }
+          : local.thread
+            ? { thread: local.thread }
+            : {}),
         ...(local.transportScope ? { transportScope: local.transportScope } : {}),
         // A monotonic "now" ts so the reply is ordered as a NEW message in the origin session.
         // Without it, transcriptCoords derives the ts from the msgId's random UUID, which the

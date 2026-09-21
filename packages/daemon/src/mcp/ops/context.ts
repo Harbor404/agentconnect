@@ -187,7 +187,13 @@ export interface SessionContext {
    *  thread titles are valid only for app-DM sessions. */
   isDm: boolean
   channel: string
+  /** The SESSION's coordinate — session-key lookups and transcript rows read this. It is
+   *  NOT a platform thread where the conversation appends (channel-session-mode.md §3.1). */
   thread: string
+  /** Where a tool that POSTS defaults to, as of the turn that OPENED this session. The
+   *  bridge is registered once per session, so a later turn in another physical thread needs
+   *  `deliveryThreadNow()` instead; this is the fallback when no turn is live. */
+  deliveryThread: string
   tools: ToolDescriptor[]
   /**
    * Binds the shared memory tools to THIS trigger's store (#41). Every path that
