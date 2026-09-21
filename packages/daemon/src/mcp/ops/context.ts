@@ -72,6 +72,12 @@ export type UploadOutcome =
    *  a report that omits what the platform actually said cannot be acted on. */
   | { ok: false; reason: UploadFailReason; detail?: string }
 
+// A turn-bound image sender; its destination and reply anchor are captured by the platform.
+export type ImageUploader = (
+  file: { bytes: Buffer; name: string; mimeType: string },
+  caption?: string
+) => Promise<UploadOutcome>
+
 export interface MessageGateway {
   /** Layer-1 `openDirectMessage`: resolve one platform user to the app's real
    *  direct-message conversation. Optional because it is a declared read port,

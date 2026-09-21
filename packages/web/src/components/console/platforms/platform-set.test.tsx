@@ -143,7 +143,8 @@ describe('platform set', () => {
       'Discord',
       'Lark',
       'Feishu',
-      'Linear'
+      'Linear',
+      'QQ'
     ])
   })
 

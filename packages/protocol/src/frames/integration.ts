@@ -74,6 +74,9 @@ export const IntegrationSlackConfig = z.object({
 })
 export type IntegrationSlackConfig = z.infer<typeof IntegrationSlackConfig>
 
+export const IntegrationQQConfig = z.object({ appId: z.string().min(1), appSecret: z.string().min(1) })
+export type IntegrationQQConfig = z.infer<typeof IntegrationQQConfig>
+
 /**
  * The Telegram config payload — long-polling + routing (grammY). Telegram has a
  * SINGLE BotFather HTTP token — no app-level token and no signing secret

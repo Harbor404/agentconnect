@@ -265,6 +265,8 @@ import { codeHostProviders } from './codehost/registry.js'
 import { CodeHostTrustedActorService } from './codehost/trusted-actor.service.js'
 import { botIdentityProjector } from './platforms/bot-identity.js'
 import { buildPendingInstallReapers, platformBackgroundLoops } from './platforms/lifecycle.js'
+import { createQQCpProvider } from './platforms/qq/provider.js'
+import { QQCredentialRoutes } from './platforms/qq/routes.js'
 import { createTelegramCpProvider } from './platforms/telegram/provider.js'
 import { createDiscordCpProvider } from './platforms/discord/provider.js'
 import { createSlackCpProvider, createSlackToolingCredentials } from './platforms/slack/provider.js'
@@ -2096,6 +2098,7 @@ export function buildContainer(
   // core ASKS is answered by the registry, and what tests INJECT is the seams
   // above.
   composedPlatforms = buildCpPlatformRegistry([
+    createQQCpProvider(undefined, [QQCredentialRoutes(httpDeps)]),
     createTelegramCpProvider({
       verifyBot: verifyTelegramBot,
       syncBotIcon: syncTelegramBotIcon,

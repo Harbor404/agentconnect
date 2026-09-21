@@ -16,6 +16,7 @@ import type { TelegramAction, TelegramConverger } from '../telegram/render.js'
 import type { DiscordAction, DiscordConverger } from '../discord/render.js'
 import type { FeishuAction, FeishuConverger } from '../feishu/render.js'
 import type { LinearAction, LinearConverger } from '../platforms/linear/turn-output.js'
+import type { QQAction, QQConverger } from '../platforms/qq/turn-output.js'
 import type { PlatformConnection } from '../platforms/connection-reconciler.js'
 import type { SlackConnection } from '../slack/connection.js'
 import type { TelegramConnection } from '../telegram/connection.js'
@@ -441,8 +442,9 @@ export interface MemoryExtractionCollector {
  *  converger. Each surface narrows to its own arm; the unions exist because the
  *  turn record is still core-owned (they dissolve when the convergers move with
  *  their platforms). */
-export type DaemonRenderAction = SlackAction | TelegramAction | DiscordAction | FeishuAction | LinearAction
-export type DaemonConverger = OutputConverger | TelegramConverger | DiscordConverger | FeishuConverger | LinearConverger
+export type DaemonRenderAction = QQAction | SlackAction | TelegramAction | DiscordAction | FeishuAction | LinearAction
+export type DaemonConverger =
+  QQConverger | OutputConverger | TelegramConverger | DiscordConverger | FeishuConverger | LinearConverger
 
 /**
  * §7.3 per-turn platform state. Each shape is owned by exactly one turn-output

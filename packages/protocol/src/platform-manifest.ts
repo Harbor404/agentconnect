@@ -54,6 +54,8 @@ export type LeaveGranularity = 'conversation' | 'space'
 export interface PlatformManifest {
   /** Diagnostic label; never parsed. */
   readonly platform: string
+  /** Read before issuing console continuation tokens or dispatching a mirrored turn. */
+  readonly consoleContinuation: boolean
   readonly membershipEnumeration: MembershipEnumeration
   /** Channel ids syntactically recognizable as DIRECT MESSAGES, for ingress whose
    *  wire event omits the conversation type (Slack `app_mention` may omit
@@ -108,6 +110,7 @@ export interface PlatformManifest {
 
 /** The conservative arm of every axis — see the fail-closed note above. */
 export const DEFAULT_MANIFEST: Omit<PlatformManifest, 'platform'> = {
+  consoleContinuation: false,
   membershipEnumeration: 'observed',
   botSenderRouting: false,
   // The arm the retired branch took for every non-Discord id: an unknown
@@ -129,6 +132,7 @@ export const DEFAULT_MANIFEST: Omit<PlatformManifest, 'platform'> = {
  * axes — a fail-OPEN hole in the exact guarantee this module sells.
  */
 const MANIFESTS = new Map<string, Omit<PlatformManifest, 'platform'>>([
+  ['qq', { ...DEFAULT_MANIFEST, dmChannelPattern: /^dm:/ }],
   // Slack is the only platform with an authoritative membership snapshot — which
   // is why the branches this replaces read "Slack does X, everyone else does Y".
   // It is also the only platform whose normalizer attributes bot authorship AND
@@ -136,6 +140,7 @@ const MANIFESTS = new Map<string, Omit<PlatformManifest, 'platform'>>([
   [
     'slack',
     {
+      consoleContinuation: true,
       membershipEnumeration: 'authoritative',
       dmChannelPattern: /^D/,
       botSenderRouting: true,
@@ -148,6 +153,7 @@ const MANIFESTS = new Map<string, Omit<PlatformManifest, 'platform'>>([
   [
     'telegram',
     {
+      consoleContinuation: true,
       membershipEnumeration: 'observed',
       botSenderRouting: false,
       leaveGranularity: 'conversation',
@@ -161,6 +167,7 @@ const MANIFESTS = new Map<string, Omit<PlatformManifest, 'platform'>>([
   [
     'discord',
     {
+      consoleContinuation: true,
       membershipEnumeration: 'observed',
       botSenderRouting: false,
       leaveGranularity: 'space',
@@ -172,6 +179,7 @@ const MANIFESTS = new Map<string, Omit<PlatformManifest, 'platform'>>([
   [
     'feishu',
     {
+      consoleContinuation: true,
       membershipEnumeration: 'observed',
       botSenderRouting: false,
       leaveGranularity: 'conversation',
@@ -185,6 +193,7 @@ const MANIFESTS = new Map<string, Omit<PlatformManifest, 'platform'>>([
   [
     'linear',
     {
+      consoleContinuation: false,
       membershipEnumeration: 'observed',
       botSenderRouting: false,
       leaveGranularity: 'conversation',

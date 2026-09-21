@@ -759,6 +759,7 @@ export type CreateIntegrationInput =
       transport: 'socket' | 'http'
       slack?: { botToken: string; appToken: string } | { botToken: string; signingSecret: string }
     })
+  | (CreateIntegrationBase & { platform: 'qq'; qq?: { appId: string; appSecret: string } })
   | (CreateIntegrationBase & { platform: 'telegram'; telegram?: { botToken: string } })
   | (CreateIntegrationBase & { platform: 'discord'; discord?: { botToken: string } })
   | (CreateIntegrationBase & {
@@ -1313,7 +1314,7 @@ export function setApiOrgId(orgId: string | null): void {
 
 /** The active org's API prefix. Org-scoped calls before the org resolves are a
  *  programming error (data pulls wait for the org context) — fail loudly. */
-function orgBase(orgId?: string): string {
+export function orgBase(orgId?: string): string {
   const resolved = orgId ?? apiOrgId
   if (!resolved) throw new ApiError('no active organization', 0)
   return `/orgs/${encodeURIComponent(resolved)}`
@@ -1659,7 +1660,7 @@ async function apiPatch<T>(path: string, body: unknown): Promise<T> {
   return (await res.json()) as T
 }
 
-async function apiPut<T>(path: string, body?: unknown): Promise<T> {
+export async function apiPut<T>(path: string, body?: unknown): Promise<T> {
   const res = await authenticatedFetch(
     path,
     {

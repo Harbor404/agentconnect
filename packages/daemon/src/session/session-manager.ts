@@ -255,10 +255,10 @@ export class SessionManager {
       }) => McpServer[]
       /**
        * Download an inbound attachment's bytes (§9.2) — resolved by the daemon
-       * to the owning SlackConnection's bot-token fetch. Omitted in the `chat`
+       * to the ingress integration's platform connection. Omitted in the `chat`
        * CLI / tests, where attachments degrade to baseline resource_link blocks.
        */
-      downloadAttachment?: (agentId: string, att: Attachment) => Promise<Buffer | null>
+      downloadAttachment?: (agentId: string, att: Attachment, integrationId?: string) => Promise<Buffer | null>
       /** Inline cap (bytes) for attachments; files over it become resource_link. */
       attachmentMaxBytes?: number
       /**
@@ -425,7 +425,7 @@ export class SessionManager {
       transcriptChannel,
       thread,
       ts,
-      download: (att) => this.deps.downloadAttachment?.(agentId, att) ?? Promise.resolve(null),
+      download: (att) => this.deps.downloadAttachment?.(agentId, att, integrationId) ?? Promise.resolve(null),
       ...(this.deps.attachmentMaxBytes !== undefined ? { attachmentMaxBytes: this.deps.attachmentMaxBytes } : {})
     })
     ts = ingested.ts
@@ -869,7 +869,7 @@ export class SessionManager {
       const attBlocks = await abortable(
         () =>
           buildAttachmentBlocks(ingested.attachments!, {
-            download: (att) => this.deps.downloadAttachment?.(agentId, att) ?? Promise.resolve(null),
+            download: (att) => this.deps.downloadAttachment?.(agentId, att, integrationId) ?? Promise.resolve(null),
             supports: (kind) => host.promptSupports?.(kind) ?? false,
             ...(this.deps.attachmentMaxBytes !== undefined ? { maxBytes: this.deps.attachmentMaxBytes } : {})
           }),

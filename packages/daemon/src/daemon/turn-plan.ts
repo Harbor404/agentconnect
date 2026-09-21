@@ -86,6 +86,7 @@ export interface TurnPlan {
   readonly statusOptions: ReturnType<typeof slackStatusOptions>
   readonly protectedAddresses: readonly string[]
 
+  readonly refreshBeforePrompt: boolean
   readonly stageAnswer: boolean
   readonly webchatRefresh: boolean
   readonly loopGuardScope: string
@@ -132,6 +133,11 @@ export function buildTurnPlan(input: TurnPlanInput): TurnPlan {
   }
   const sourceHopCount = callMeta?.hopCount ?? 0
   const githubReplyBatch = hookContext?.githubReviewBatch
+  const chatContextRefresh =
+    input.features.turnFinalContextRefresh && !webchat && !githubReply && originKindOf(msg.platform) === 'chat'
+  const webchatRefresh = input.features.turnFinalContextRefresh && !!webchat && msg.platform === 'webchat'
+  const stageAnswer =
+    chatContextRefresh && (suppressReplyConn || turnSurfaces.exact(msg.platform)?.answerDelivery?.(turnCtx) !== 'live')
   return {
     sessionKey: input.sessionKey,
     agentId,
@@ -169,9 +175,9 @@ export function buildTurnPlan(input: TurnPlanInput): TurnPlan {
     turnCtx,
     statusOptions: slackStatusOptions(msg.platform, agentName, iconUrl, input.sessionKey),
     protectedAddresses: input.protectedAddresses,
-    stageAnswer:
-      input.features.turnFinalContextRefresh && !webchat && !githubReply && originKindOf(msg.platform) === 'chat',
-    webchatRefresh: input.features.turnFinalContextRefresh && !!webchat && msg.platform === 'webchat',
+    refreshBeforePrompt: chatContextRefresh || webchatRefresh,
+    stageAnswer,
+    webchatRefresh,
     loopGuardScope: loopGuardScope(msg),
     sourceHopCount,
     ...(callMeta && hasReachedAgentCallHopLimit(sourceHopCount + 1)

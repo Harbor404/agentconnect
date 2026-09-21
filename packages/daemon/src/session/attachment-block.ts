@@ -40,6 +40,7 @@ export function attachmentToBlock(
     // over `data`, breaking auth-gated URLs despite having bytes. Remove via #52.
     return { type: 'image', data: bytes.toString('base64'), mimeType: att.mimeType }
   }
+  if (isImage && att.unavailableText) return { type: 'text', text: att.unavailableText }
   if (bytes && supports('embeddedContext')) {
     const uri = att.sourceUrl ?? `attachment://webchat/${encodeURIComponent(att.id)}`
     if (att.mimeType.startsWith('text/')) {

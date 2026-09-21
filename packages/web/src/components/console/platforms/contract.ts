@@ -641,6 +641,8 @@ export interface WebAgentIntegrationCardFacet {
 export interface WebPlatformModule<TApi = unknown> {
   /** Platform id (§6.1 vocabulary). Never parsed. */
   readonly platformId: string
+  /** Display-only label for an unresolved human sender; stored identities and known names take precedence. */
+  senderFallback?(senderId: string): string | undefined
   /**
    * The platform's brand mark, sized by its box like today's `fillPct`
    * convention (marks.tsx:207-216). Replaces the chat arms of

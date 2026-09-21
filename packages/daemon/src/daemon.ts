@@ -260,6 +260,9 @@ import {
 } from './router/routing-rule.js'
 import { CpRoutingLayer } from './router/cp-routing-layer.js'
 import { SlackConnection, type SlackAppFactory, type SlackStatusOptions } from './slack/connection.js'
+import { QQConnection } from './platforms/qq/connection.js'
+import { createQQTurnOutput } from './platforms/qq/surface.js'
+import { QQCommandChrome } from './platforms/qq/command-chrome.js'
 import { TelegramConnection, type TelegramCallback } from './telegram/connection.js'
 import { DiscordConnection } from './discord/connection.js'
 import { FeishuConnection } from './feishu/connection.js'
@@ -1050,6 +1053,7 @@ export class Daemon {
     registry.register(discordCommandChrome)
     registry.register(feishuCommandChrome)
     registry.register(linearCommandChrome)
+    registry.register(QQCommandChrome)
     return registry
   })()
 
@@ -1133,6 +1137,19 @@ export class Daemon {
           this.enqueueApply(p, { kind: 'card-cancel' }, { allowWhenSuppressed: true })
         }
       })
+      registry.register(
+        createQQTurnOutput(async (p, text) => {
+          if (p.plan.transcriptChannel && p.plan.statusThread)
+            await this.store.appendTranscript({
+              channel: p.plan.transcriptChannel,
+              thread: p.plan.statusThread,
+              ts: monotonicTs(),
+              sender: p.plan.agentId,
+              kind: 'text',
+              text
+            })
+        })
+      )
       registry.register({
         platform: 'linear',
         createConverger: (ctx) => createLinearConverger(ctx),
@@ -1222,6 +1239,7 @@ export class Daemon {
   // integrationId -> the FeishuConnection that owns it (for replies). Separate from
   // connByIntegration so Slack reconcile (which reads `.appToken`) never sees a Feishu conn.
   private fsConnByIntegration = new Map<string, FeishuConnection>()
+  private QQConnByIntegration = new Map<string, QQConnection>()
   // integrationId -> the LinearConnection that owns it. Linear's only reply surface is the
   // agent activity feed (§4.6), so this is the egress port every Linear write resolves through.
   private lnConnByIntegration = new Map<string, LinearConnection>()
@@ -1744,6 +1762,7 @@ export class Daemon {
         telegram: this.tgConnByIntegration,
         discord: this.dcConnByIntegration,
         feishu: this.fsConnByIntegration,
+        qq: this.QQConnByIntegration,
         linear: this.lnConnByIntegration
       }),
       bindSlack: (integrationId, conn, botUserId) => {
@@ -1756,6 +1775,7 @@ export class Daemon {
         this.bind(this.dcConnByIntegration, integrationId, conn, botUserId),
       bindFeishu: (integrationId, conn, botOpenId) =>
         this.bind(this.fsConnByIntegration, integrationId, conn, botOpenId),
+      bindQQ: (id, conn, botId) => this.bind(this.QQConnByIntegration, id, conn, botId),
       bindLinear: (integrationId, conn, appUserId) =>
         this.bind(this.lnConnByIntegration, integrationId, conn, appUserId),
       unbindIntegration: (integrationId) => this.unbindIntegration(integrationId),
@@ -1841,6 +1861,7 @@ export class Daemon {
     this.dcConnByIntegration.delete(integrationId)
     this.fsConnByIntegration.delete(integrationId)
     this.lnConnByIntegration.delete(integrationId)
+    this.QQConnByIntegration.delete(integrationId)
     delete this.botUserIds[integrationId]
     this.channelSnapshots.delete(integrationId)
   }
@@ -3070,6 +3091,12 @@ export class Daemon {
         const { headless: _headless, synthetic: _synthetic, ...target } = t
         return { ok: true, ...target }
       },
+      imageUploaderFor: (ctx) => {
+        const key = sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
+        const p = [...this.pending.values()].find((turn) => turn.plan.sessionKey === key)
+        if (!p || p.outputSuppressed || !this.toolTurnRunnable(ctx)) return undefined
+        return this.turnSurfaces.exact(p.plan.platform)?.imageUploader?.(p)
+      },
       readWorkspaceImage: async (ctx, rel): Promise<ShareReadResult> => {
         const scope = createWorkspaceScope({
           workspaces: this.workspaces,
@@ -3425,12 +3452,13 @@ export class Daemon {
         )
         return servers
       },
-      // §9.2: download inbound attachment bytes via the agent's Slack connection
-      // (bot-token auth). Returns null (→ baseline resource_link) if no connection.
-      downloadAttachment: (agentId, att) =>
+      // Download from the actual ingress integration, including platforms without a legacy reply connection.
+      downloadAttachment: (agentId, att, integrationId) =>
         att.sourceUrl
-          ? (this.replyConnFor(agentId)?.downloadFile?.(att.sourceUrl, this.cfg.limits.maxAttachmentBytes) ??
-            Promise.resolve(null))
+          ? (this.commandConnFor(agentId, integrationId)?.downloadFile(
+              att.sourceUrl,
+              this.cfg.limits.maxAttachmentBytes
+            ) ?? Promise.resolve(null))
           : Promise.resolve(null),
       attachmentMaxBytes: cfg.limits.maxAttachmentBytes,
       // §8.4/§8.5/§9.2: snapshot real Slack thread history for cold backfill and
@@ -3721,6 +3749,7 @@ export class Daemon {
 
   /** Phase 27 — Slack connections gate boot; the long-poll/gateway platforms deliberately do not. */
   private async openPlatformConnections(agents: LoadedAgent[]): Promise<void> {
+    void this.connections.reconcileQQConnections().catch(() => this.log.warn('qq: initial connect failed'))
     // open consolidated Slack connections, resolve bot user ids (merged rules are per-message)
     await this.connections.openInitialSlackConnections(agents)
     // Open send-only Slack clients for HTTP bots (inbound lives on the relay).
@@ -4140,6 +4169,7 @@ export class Daemon {
       await this.connections.reconcileDiscordConnections()
       await this.connections.reconcileFeishuConnections()
       await this.connections.reconcileLinearConnections()
+      await this.connections.reconcileQQConnections()
       // Converged for real: the sockets a duty change invalidated are closed. Publishing the
       // CLAIMED value (not the current one) leaves a duty change that landed mid-pass outstanding,
       // so the trailing re-run still converges it.
@@ -10822,6 +10852,7 @@ export class Daemon {
    * platform gets for free by owning its reply connection.
    */
   private readonly platformTurnEgress = new Map<string, (integrationId?: string) => PlatformConnection | undefined>([
+    ['qq', (id) => (id ? this.QQConnByIntegration.get(id) : undefined)],
     ['linear', (integrationId) => (integrationId ? this.lnConnByIntegration.get(integrationId) : undefined)]
   ])
 
@@ -11461,6 +11492,7 @@ export class Daemon {
           reason?: string
           duplicate?: boolean
           steered?: boolean
+          queued?: boolean
         }): Promise<void> => {
           if (admissionSettled) return
           admissionSettled = true
@@ -11497,6 +11529,40 @@ export class Daemon {
             }
           }
           await opts?.onAdmission?.(result)
+          const surface = this.turnSurfaces.exact(msg.platform)
+          if (
+            result.accepted &&
+            !result.duplicate &&
+            surface?.onAdmission &&
+            !opts?.replay &&
+            !opts?.isQueueCmd &&
+            !msg.headless &&
+            msg.source === 'user' &&
+            !webchat &&
+            callMeta?.initializeOnly !== true
+          ) {
+            try {
+              const agent = this.agents.get(agentId)
+              const mode = (await this.store.getOutputModeOverride(key)) ?? agent?.output.mode ?? 'none'
+              const egress = this.commandConnFor(agentId, integrationId)
+              if (mode !== 'none' && egress && !entry.initAbort.signal.aborted) {
+                const release = this.holdReplyConnection(egress)
+                // Enqueue before execution begins, but never hold admission on a provider response.
+                void Promise.resolve()
+                  .then(() =>
+                    surface.onAdmission!(
+                      { message: msg, isDm: msg.isDm, mode, showFooter: agent?.output.showFooter ?? false, egress },
+                      result.steered ? 'steered' : result.queued ? 'queued' : 'processing',
+                      entry.initAbort.signal
+                    )
+                  )
+                  .catch(() => this.log.warn('platform admission feedback failed'))
+                  .finally(release)
+              }
+            } catch {
+              this.log.warn('platform admission feedback unavailable')
+            }
+          }
         }
         // Drain gate for the dispatch entry itself — covers cron fires and `!queue`
         // that bypass onInbound's gate (§5.3: a draining unit starts no turn). Applied
@@ -11736,7 +11802,7 @@ export class Daemon {
                 await settleAdmission({ accepted: true })
                 return
               }
-              await settleAdmission({ accepted: true })
+              await settleAdmission({ accepted: true, queued: !reclaimedGate })
               settleHold('run')
             } catch (error) {
               // Rejecting the caller while its entry stays runnable would run a turn nobody owns.
@@ -13318,7 +13384,7 @@ export class Daemon {
       handled.contextRevision ??
       (await this.store.threadTranscriptRevision(p.plan.transcriptChannel, p.plan.sessionThread, p.plan.agentId))
     let providerCheckpoint = handled.providerCheckpoint
-    if (p.plan.stageAnswer || p.plan.webchatRefresh) {
+    if (p.plan.refreshBeforePrompt) {
       // Queue entries remain untouched until every gate above has succeeded.
       const initialRefresh = await this.refreshTurnContext(p, baseRevision, providerCheckpoint, false)
       // Webchat: a co-hosted participant's recipient-delivery bump can re-surface
@@ -17031,6 +17097,7 @@ export class Daemon {
     for (const [id, c] of this.tgConnByIntegration) if (c === conn) out.push(id)
     for (const [id, c] of this.dcConnByIntegration) if (c === conn) out.push(id)
     for (const [id, c] of this.fsConnByIntegration) if (c === conn) out.push(id)
+    for (const [id, c] of this.QQConnByIntegration) if (c === conn) out.push(id)
     for (const [id, c] of this.lnConnByIntegration) if (c === conn) out.push(id)
     return out
   }
@@ -17287,7 +17354,11 @@ export class Daemon {
   /** The live connection serving `integrationId` on ANY platform — the reply-capable registry
    *  plus Linear, whose connection renders chrome and serves its session tools itself. */
   private anyConnForIntegration(integrationId: string): PlatformConnection | undefined {
-    return this.connForIntegration(integrationId) ?? this.lnConnByIntegration.get(integrationId)
+    return (
+      this.connForIntegration(integrationId) ??
+      this.lnConnByIntegration.get(integrationId) ??
+      this.QQConnByIntegration.get(integrationId)
+    )
   }
 
   /** CP-owned cron ids currently held in memory. */

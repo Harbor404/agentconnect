@@ -73,6 +73,7 @@ import { useProfile } from '@/lib/profile'
 import { usePgDraft, usePgDraftHasText, usePlayground } from '@/components/console/PlaygroundProvider'
 import { AgentIconView, LoadingState, ModelMark, PlatformMark, SocialLoginMark, Spinner } from '@/components/marks'
 import { MessageText } from '@/components/console/MessageText'
+import { platformSenderFallback } from '../platforms/registry'
 import { McpAppCard, type McpAppCardProps } from '@/components/console/McpAppCard'
 import { UserTurnDetails } from '../UserTurnDetails'
 import { parseUserTurnBody } from '@/lib/user-turn-body'
@@ -4207,7 +4208,13 @@ export default function SessionDetailView() {
           ? speaker('@you')
           : speaker(
               senderAgentName ?? m.sender,
-              cron?.name ?? (cron ? 'Schedule' : senderLabel(m.sender, m.senderName ?? hookFallback))
+              cron?.name ??
+                (cron
+                  ? 'Schedule'
+                  : senderLabel(
+                      m.sender,
+                      m.senderName ?? hookFallback ?? platformSenderFallback(rowPlatform, m.sender)
+                    ))
             )
         pushUserTurn(senderAgent?.id ?? m.sender, {
           kind: 'user',
@@ -4262,7 +4269,10 @@ export default function SessionDetailView() {
         }
         const participant = self
           ? speaker('@you')
-          : speaker(senderAgentName ?? who, cron?.name ?? (cron ? 'Schedule' : senderAgentName))
+          : speaker(
+              senderAgentName ?? who,
+              cron?.name ?? (cron ? 'Schedule' : (senderAgentName ?? platformSenderFallback(session.platform, who)))
+            )
         pushUserTurn(senderAgent?.id ?? who, {
           kind: 'user',
           key: `u:${liveAnchor(stp)}`,

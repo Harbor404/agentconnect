@@ -25,6 +25,8 @@ export interface Attachment extends Omit<PlatformAttachment, 'sourceUrl'> {
   sourceUrl?: string
   /** Already-bounded bytes from webchat, absent for provider-backed attachments. */
   inlineData?: Buffer
+  // Provider-owned fallback when the image cannot be downloaded or displayed by the runtime.
+  unavailableText?: string
   /** Bytes fetched from `thumbnailUrl` for transcript preview only, set when the
    *  full download (`inlineData`) doesn't fit the console history budget. Kept
    *  apart from `inlineData` so the ACP prompt block never receives it. */
