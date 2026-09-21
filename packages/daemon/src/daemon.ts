@@ -184,6 +184,8 @@ import {
   clearConfigFiles,
   materializeConfigFiles
 } from './shim/config-file-env.js'
+import { DEFAULT_SHIM_RUNTIME_ROOT, shimPaths } from './shim/sandbox-paths.js'
+import type { SpawnFile } from './acp/spawn-driver.js'
 import { writeGhShim } from './cp/gh-shim.js'
 import { glabSessionEnv, writeGlabShim } from './cp/glab-shim.js'
 import { GitCredServer, gitcredShimPath, gitcredSocketPath, writeGitcredShim } from './cp/gitcred-server.js'
@@ -3471,6 +3473,14 @@ export class Daemon {
         this.refreshAdmittedRuntimes()
         return seedSessionHome(home, this.runtimes, this.log)
       },
+      // What a local agent here would start, so a holder never names a path in its own store (§8): a VM its image's adapter, a host process this machine's install.
+      runtimeLaunch: async (runtimeId, strategy) => {
+        if (strategy === 'host') await this.ensureRuntimeInstalled(runtimeId, this.localRuntimeCatalog !== undefined)
+        const catalog =
+          strategy === 'microsandbox' ? this.microsandboxCatalog : (this.localRuntimeCatalog ?? this.runtimeCatalog)
+        const runtime = catalog?.entries[runtimeId]?.runtime
+        return runtime && { command: runtime.command, args: [...runtime.args] }
+      },
       agentsExist: async (agentIds) => {
         if (!this.cpClient) throw new Error('no control plane connection')
         return this.cpClient.agentsExist(agentIds)
@@ -3492,17 +3502,21 @@ export class Daemon {
     // Under --k8s every isolated session already gets a pod of the install's own pool; nothing spreads (§11).
     if (this.k8s) return
     this.executorPlane = new ExecutorPlane({
-      prepare: (launch) =>
-        this.requireCp('executor/prepare').executorPrepare(
+      prepare: (launch) => {
+        // Named so the executor can answer with its own install of it (§8).
+        const runtime = this.agents.get(launch.agentId)?.runtime
+        return this.requireCp('executor/prepare').executorPrepare(
           {
             agentId: launch.agentId,
             sessionKey: launch.sessionKey,
             executorDaemonId: launch.executorDaemonId,
             launchId: launch.launchId,
-            strategy: launch.strategy
+            strategy: launch.strategy,
+            ...(runtime ? { runtime } : {})
           },
           this.orgForAgent(launch.agentId)
-        ),
+        )
+      },
       release: (placed, launchId) =>
         this.requireCp('executor/release').executorRelease(
           {
@@ -5261,8 +5275,13 @@ export class Daemon {
     await this.stopHost(agentId)
   }
 
-  /** Construct + memoize the host for `key`; `cwd` is the session directory for a session-bound host. */
-  private ensureHost(key: HostKey, cfg: ReturnType<typeof loadConfig>, cwd?: string): AcpHost {
+  /** Construct + memoize the host for `key`; `cwd` is the session directory for a session-bound host, `sessionGitDirs` its clones' `.git` when they are off this disk. */
+  private ensureHost(
+    key: HostKey,
+    cfg: ReturnType<typeof loadConfig>,
+    cwd?: string,
+    sessionGitDirs?: string[]
+  ): AcpHost {
     const host = this.hosts.get(key)
     if (host) return host
     const agentId = hostKeyAgentId(key)
@@ -5272,12 +5291,13 @@ export class Daemon {
       hostKey: key,
       runInSandbox: this.agentRunsInSandbox(agent),
       cwd: launchCwd,
-      warnOnSandboxDowngrade: true
+      warnOnSandboxDowngrade: true,
+      ...(sessionGitDirs ? { sessionGitDirs } : {})
     })
     this.hosts.set(key, built.host)
     this.hostLaunch.set(key, { agentDir: agent.dir, cwd: launchCwd })
     this.hostStartedAt.set(key, this.clock.now())
-    this.hostConfigFiles.set(agentId, { agentDir: agent.dir, ...built.configFileState })
+    if (built.configFileState) this.hostConfigFiles.set(agentId, { agentDir: agent.dir, ...built.configFileState })
     return built.host
   }
 
@@ -5306,10 +5326,13 @@ export class Daemon {
       warnOnSandboxDowngrade?: boolean
       excludeAgentToolCredentials?: boolean
       modelCredential?: { target: ModelProviderTarget; credential: ModelCredential }
+      /** A session whose clones are off this disk: their `.git`, as the filesystem holding them answered. */
+      sessionGitDirs?: string[]
     }
   ): {
     host: AcpHost
-    configFileState: { childEnv?: Record<string, string | undefined>; materialized: boolean }
+    /** Undefined for a host whose config files travel with its launch: it keeps none on this disk. */
+    configFileState?: { childEnv?: Record<string, string | undefined>; materialized: boolean }
   } {
     const agentId = agent.id
     const onUpdate = (sid: string, u: any) => this.enqueueAcpUpdate(opts.hostKey, sid, u)
@@ -5333,7 +5356,7 @@ export class Daemon {
         this.externalMemoryAdmission(agent.id)
       ).runtimeEnv()
     }
-    let configFileState: { childEnv?: Record<string, string | undefined>; materialized: boolean } = {
+    let configFileState: { childEnv?: Record<string, string | undefined>; materialized: boolean } | undefined = {
       materialized: false
     }
     if (this.opts.hostFactory) {
@@ -5347,11 +5370,15 @@ export class Daemon {
       micro && !remoteSession ? this.microsandboxPlacement(agent, opts.cwd, opts.hostKey) : undefined
     // Its HOME is the one its executor seeded, on the root that machine's shim reported; without it a launch would name this disk (§7, §8).
     const remoteHome = remoteSession && this.executorPlane?.homeFor(remoteSession.subject)
-    if (remoteSession && !remoteHome) {
+    // The roots its `prepare` named, where the session gitconfig and config files land in that machine's environment (§5).
+    const remoteRoots = remoteSession && this.executorPlane?.rootsFor(remoteSession.sessionKey)
+    if (remoteSession && (!remoteHome || !remoteRoots)) {
       throw new Error(
         `session ${remoteSession.leaf} has no environment on daemon ${remoteSession.executorDaemonId} to launch in — its next turn prepares one`
       )
     }
+    // And its adapter is the one that machine installed, never a path in this machine's store (§8).
+    const launchDef = (remoteSession && this.executorPlane?.runtimeDefFor(remoteSession.sessionKey, runtime)) || runtime
     // A dream reads only its materialized inputs to produce a memory proposal, so
     // it never needs the agent's TOOL credentials (github-app git helper, gh
     // wrapper, or materialized `*_DATA` config-file secrets like KUBECONFIG /
@@ -5420,7 +5447,6 @@ export class Daemon {
     const sessionGitIdentity = managedCredentials ? this.gitCommitIdentity : undefined
     const needsSessionGit = managedCredentials || agent.workspace.mode === 'git-repo'
     // A session on an executor reads the same file in that machine's environment, at the roots its `prepare` named (§5).
-    const remoteRoots = remoteSession && this.executorPlane?.rootsFor(remoteSession.sessionKey)
     const sandboxGitTarget = remoteRoots
       ? sandboxGitCredentialTarget(remoteRoots.runtimeRoot, remoteRoots.helperRoot)
       : sandboxGitCredentialTarget()
@@ -5495,6 +5521,14 @@ export class Daemon {
       env.PATH = `${[...shimDirs].join(':')}:${env.PATH ?? runtimeEnv.PATH ?? process.env.PATH ?? ''}`
     }
     const target = opts.modelCredential?.target ?? modelProviderTarget(agent, runtime)
+    // A runtime on another filesystem reads its config files there, so they travel with its launch as the gitconfig does (§8): the pod's image root, or the one an executor reported.
+    const launchFilesRoot = remoteRoots
+      ? remoteRoots.runtimeRoot
+      : this.k8sPlane
+        ? DEFAULT_SHIM_RUNTIME_ROOT
+        : undefined
+    if (launchFilesRoot !== undefined) configFileState = undefined
+    let launchConfigFiles: { dir: string; files: SpawnFile[] } | undefined
     // OS sandbox decision (issue #312). security.requireSandbox forces every agent
     // on; otherwise the per-agent preference is effective only when this host has a
     // mechanism. The writable set is derived from the TRUSTED agent dir
@@ -5517,8 +5551,9 @@ export class Daemon {
             }
           : {}),
         ...(remoteHome ? { executor: { home: remoteHome } } : {}),
+        ...(opts.sessionGitDirs ? { sessionGitDirs: opts.sessionGitDirs } : {}),
         runtimeId: runtimeEntry?.aliasOf ?? agent.runtime,
-        runtime,
+        runtime: launchDef,
         provider: memoryKindOf(agent),
         scopeDir: agent.dir,
         cwd: opts.cwd,
@@ -5529,7 +5564,11 @@ export class Daemon {
         runtimeEnv,
         agentEnv: env,
         // A dream host materializes nothing: it has no cleanup path and needs none of these secrets.
-        ...(excludeAgentToolCredentials ? {} : { configFileDir: agent.dir }),
+        ...(excludeAgentToolCredentials
+          ? {}
+          : launchFilesRoot !== undefined
+            ? { configFileLaunchDir: shimPaths(launchFilesRoot).configFilesDir }
+            : { configFileDir: agent.dir }),
         finalizeLaunchEnv: (launchEnv) => {
           // A dream host on OpenCode carries the daemon-authored `read-only` agent, which the extraction gate prefers over `plan`.
           // Every launch but a pod inherits this daemon's environment beneath the explicit env, so overlay that value too.
@@ -5577,7 +5616,8 @@ export class Daemon {
       })
       if (assembled.configFiles) {
         this.queueSpawnNotices(agentId, assembled.configFiles.notices)
-        if (Object.keys(assembled.configFiles.env).length > 0) {
+        launchConfigFiles = assembled.configFiles.launch
+        if (!launchConfigFiles && Object.keys(assembled.configFiles.env).length > 0) {
           configFileState = { childEnv: assembled.configFiles.sourceEnv, materialized: true }
         }
       }
@@ -5587,7 +5627,7 @@ export class Daemon {
       // session that later fails a Git write can be matched against what its host was given.
       const reopened = launch.gitMetadataWriteRoots.length > 0 ? launch.gitMetadataWriteRoots.join(', ') : 'none'
       const boundary = remoteSession
-        ? `on daemon ${remoteSession.executorDaemonId} (${remoteSession.strategy})`
+        ? `on daemon ${remoteSession.executorDaemonId} (${remoteSession.strategy}, ${launchDef === runtime ? 'adapter as defined here' : 'its own adapter install'})`
         : `sandbox ${runInSandbox ? 'on' : 'off'}`
       this.log.info(
         `acp: agent "${agentId}" host launch — ${boundary}, cwd ${opts.cwd}, git metadata reopened: ${reopened}`
@@ -5628,17 +5668,19 @@ export class Daemon {
       // Pairs the runtime's terminal exit with the ordinary rebuild — see reapTerminalHost.
       onTerminal: () => this.reapTerminalHost(opts.hostKey, constructed.host),
       env: launch.env,
-      ...(sandboxSessionGit
-        ? {
-            files: [
+      files: [
+        ...(sandboxSessionGit
+          ? [
               {
                 root: dirname(sandboxSessionGit.path),
                 relPath: [basename(sandboxSessionGit.path)],
                 content: sandboxSessionGit.content
               }
             ]
-          }
-        : {}),
+          : []),
+        ...(launchConfigFiles?.files ?? [])
+      ],
+      ...(launchConfigFiles ? { clearDirs: [launchConfigFiles.dir] } : {}),
       inheritProcessEnv: launch.inheritProcessEnv,
       runtimeId: runtimeEntry?.aliasOf ?? agent.runtime,
       isolateAccountApps: cfg.security.isolateAccountApps,
@@ -5844,7 +5886,7 @@ export class Daemon {
           }
         }
       })
-      if (configFileState.childEnv) {
+      if (configFileState?.childEnv) {
         this.hostConfigFiles.set(agent.id, { agentDir: agent.dir, ...configFileState })
       }
       this.hostLaunch.set(hostKey, { agentDir: agent.dir, cwd })
@@ -16368,11 +16410,20 @@ export class Daemon {
       )
       if (!this.usesMicrosandbox(agent))
         await withStartupPhase('runtime', () => this.ensureRuntimeInstalled(agent.runtime, true))
+      // Clones off this disk are listed where they are, since the launch cannot read them itself; no answer grants nothing.
+      const boundKey = bound && hostKeySessionKey(key)
+      const listing = boundKey ? this.workspaces.offDiskSessionGitDirs(agent, boundKey) : undefined
+      const sessionGitDirs = listing
+        ? await listing.catch((err: unknown) => {
+            this.log.warn(`acp: could not list the clones of "${label}" where it runs: ${formatErr(err)}`)
+            return []
+          })
+        : undefined
       if (this.hostStartGeneration.get(key) !== generation) {
         throw new Error(`host start superseded for ${label}`)
       }
       // Constructs + memoizes into this.hosts, in the session directory for a session-bound host.
-      const host = this.ensureHost(key, this.cfg, bound ? (bound.cwd ?? prepared) : undefined)
+      const host = this.ensureHost(key, this.cfg, bound ? (bound.cwd ?? prepared) : undefined, sessionGitDirs)
       try {
         await withStartupPhase('runtime', () => host.start())
         if (this.hostStartGeneration.get(key) !== generation) {
