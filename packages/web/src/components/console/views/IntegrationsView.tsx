@@ -306,6 +306,7 @@ function BotsCard({
   const fragments = platformRegistry.get(platformTab.platform)?.settingsFragments
   const RowBadges = fragments?.botCard?.RowBadges
   const RowLinks = fragments?.botCard?.RowLinks
+  const RowSettings = fragments?.botCard?.RowSettings
   const RowActions = fragments?.lifecycleActions?.RowActions
   const CardNotice = fragments?.lifecycleActions?.CardNotice
   const CardProvider = fragments?.lifecycleActions?.CardProvider ?? PassThrough
@@ -530,6 +531,7 @@ function BotsCard({
               {CardNotice && <CardNotice bot={b} />}
               {open && (
                 <div className="border-b border-(--border-subtle) bg-(--surface-sunken) px-4 pb-[14px] pl-10 pt-3">
+                  {RowSettings && <RowSettings bot={b} canWrite={canWrite} />}
                   {channels.length > 0 ? (
                     <>
                       <div
