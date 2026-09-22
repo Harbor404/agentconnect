@@ -543,6 +543,36 @@ The parent session is therefore resumed as an ORDINARY turn:
 - correlation, hop count, orchestration report recording, memory behavior, and
   the per-session serial gate remain unchanged.
 
+For code-host sessions, a repository scope (`github:<id>`, `gitlab:<id>`, or
+`gitea:<id>`) identifies the conversation; it is not a chat integration ID.
+Delegation snapshots the active turn's ordinary reply target in trusted
+`CallMeta.originCodeHostReplyTarget`, persisted with the child's inbox. Later
+comments on the same issue or PR cannot replace that target. The child's first
+parent binding also stores its snapshot for later human-triggered reports;
+an active call's origin and snapshot always take precedence over that fallback.
+A parent report copies the snapshot into its own durable inbox row, with its
+own publication fence. Restart replay preserves both. It does not reopen the
+completed hook run or restore formal-review authority. GitLab and Gitea targets
+also pin the provider instance; a changed instance binding refuses publication.
+
+Only a parent-session reply inherits this output target. A Console continuation
+of a hook session remains Console-only, including work it delegates: an explicit
+null snapshot records that turn's lack of a public sink. Older calls with no
+snapshot can receive reports but cannot reconstruct an automatic public reply
+from the parent's current state or prompt text.
+
+Cross-daemon wakes and reports carry the snapshots over `rd/agentmsg` and
+`rd/agentmsg/fwd`. Both the relay and receiving daemon must advertise
+`codehost-reply-target-v1`; otherwise a delivery containing a snapshot (including
+null) returns `unsupported` before a legacy peer can silently discard it.
+Ordinary calls without these fields retain their existing compatibility.
+
+On both local and cross-daemon paths, origin-authorized replies require no reverse
+peer-visibility grant. The relay still binds the caller to its authenticated
+daemon and organization, and the receiving daemon resolves only an existing
+session owned by the target agent. Success is acknowledged after durable turn
+admission, not merely after finding the session.
+
 An earlier revision resumed the parent with `headless: true` to prevent a second
 copy of an answer the child had already delivered. That trade only holds when
 the child answered in the SAME conversation the parent would speak in. When the

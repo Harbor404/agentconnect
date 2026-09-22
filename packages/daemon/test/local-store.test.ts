@@ -49,6 +49,12 @@ const dropBirthVerdict = (db: DatabaseSync): void => {
   db.exec('ALTER TABLE sessions DROP COLUMN stayedHomeReason')
 }
 
+/** A pre-v23 store has no durable code-host output target. */
+const dropCodeHostReplyTarget = (db: DatabaseSync): void => {
+  db.exec('ALTER TABLE sessions DROP COLUMN originCodeHostReplyTarget')
+  db.exec('ALTER TABLE inbox DROP COLUMN codeHostReplyTarget')
+}
+
 /** Undo the v17 gate re-key, so a fixture's session_gates looks like the one an older daemon wrote. */
 const revertSessionGateKey = (db: DatabaseSync): void => {
   db.exec('DROP TABLE session_gates')
@@ -81,6 +87,48 @@ const dropTranscriptOrg = (db: DatabaseSync): void => {
   `)
 }
 
+it('binds the first parent reply target once and carries a separate publication fence in the report inbox', async () => {
+  const s = await store()
+  const parent = {
+    key: 'parent',
+    agentId: 'bot-a',
+    platform: 'hook',
+    channel: 'github:123',
+    thread: '42',
+    acpSessionId: 'acp-parent',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1,
+    originSessionId: 'origin'
+  }
+  await s.upsertSession(parent)
+  const target = JSON.stringify({ provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 })
+  await s.bindSessionOriginReplyTarget('parent', 'other-origin', target)
+  expect((await s.getSession('parent'))?.originCodeHostReplyTarget).toBeNull()
+  await s.bindSessionOriginReplyTarget('parent', 'origin', target)
+  await s.bindSessionOriginReplyTarget('parent', 'origin', 'null')
+  await s.upsertSession({ ...parent, updatedAt: 2 })
+  expect((await s.getSession('parent'))?.originCodeHostReplyTarget).toBe(target)
+  await s.upsertSession({ ...parent, key: 'private-child' })
+  await s.bindSessionOriginReplyTarget('private-child', 'origin', 'null')
+  await s.bindSessionOriginReplyTarget('private-child', 'origin', target)
+  expect((await s.getSession('private-child'))?.originCodeHostReplyTarget).toBe('null')
+  await s.appendInbox({
+    id: 'report',
+    sessionKey: 'parent',
+    agentId: 'bot-a',
+    msg: '{}',
+    enqueuedAt: '1',
+    codeHostReplyTarget: target,
+    posterPublishState: 'not_started'
+  })
+  expect(await s.updateInboxHookState('report', null, 'in_flight')).toBe(true)
+  expect(await s.listInboxBySessionKeyFifo()).toMatchObject([
+    { codeHostReplyTarget: target, hookContext: null, posterPublishState: 'in_flight' }
+  ])
+  await s.close()
+})
+
 describe.skipIf(pg)('LocalStore schema versioning', () => {
   const userVersion = (path: string): number => {
     const db = new DatabaseSync(path)
@@ -110,6 +158,39 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     expect(userVersion(path)).toBe(stamped)
   })
 
+  it('upgrades v22 sessions without inventing code-host authority and preserves a newly bound target on reopen', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v22-')), 'local.sqlite')
+    const initial = await LocalStore.open(path)
+    await initial.upsertSession({
+      key: 'parent',
+      agentId: 'bot-a',
+      platform: 'hook',
+      channel: 'github:123',
+      thread: '42',
+      transportScope: 'github:123',
+      acpSessionId: 'acp-parent',
+      originSessionId: 'origin',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    await initial.close()
+    const legacy = new DatabaseSync(path)
+    dropCodeHostReplyTarget(legacy)
+    legacy.exec('PRAGMA user_version = 22')
+    legacy.close()
+    const upgraded = await LocalStore.open(path)
+    const parent = (await upgraded.getSession('parent'))!
+    expect(parent.originCodeHostReplyTarget).toBeNull()
+    const target = JSON.stringify({ provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 })
+    await upgraded.bindSessionOriginReplyTarget('parent', 'origin', target)
+    await upgraded.upsertSession({ ...parent, updatedAt: 2 })
+    await upgraded.close()
+    const restarted = await LocalStore.open(path)
+    expect((await restarted.getSession('parent'))?.originCodeHostReplyTarget).toBe(target)
+    await restarted.close()
+  })
+
   it('adds permission ownership, recovery ownership and per-owner routing when upgrading a v1 store', async () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v1-')), 'local.sqlite')
     await (await LocalStore.open(path)).close()
@@ -118,6 +199,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     dropApprovalDmColumns(old)
     dropPlatformStanding(old)
     dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
     revertSessionGateKey(old)
     old.exec('DROP INDEX session_metadata_outbox_attempt')
     old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN failedAttempts')
@@ -217,6 +299,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     dropApprovalDmColumns(old)
     dropPlatformStanding(old)
     dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
     old.exec('PRAGMA user_version = 5')
     old.close()
 
@@ -266,6 +349,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     dropApprovalDmColumns(old)
     dropPlatformStanding(old)
     dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
     revertSessionGateKey(old)
     old.exec('PRAGMA user_version = 7')
     old.close()
@@ -305,6 +389,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     dropApprovalDmColumns(old)
     dropPlatformStanding(old)
     dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
     revertSessionGateKey(old)
     old.exec('PRAGMA user_version = 11')
     old.close()
@@ -332,6 +417,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     dropApprovalDmColumns(old)
     dropPlatformStanding(old)
     dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
     revertSessionGateKey(old)
     old.exec('PRAGMA user_version = 12')
     old.close()
@@ -2712,6 +2798,7 @@ describe.skipIf(pg)('transcript org migration from a v10 store', () => {
     dropApprovalDmColumns(old)
     dropPlatformStanding(old)
     dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
     revertSessionGateKey(old)
     old.exec('PRAGMA user_version = 10')
     old.close()
@@ -2783,6 +2870,7 @@ it.skipIf(pg)('backfills thread affinity from the sessions a v20 store already h
 
   // Rewind to the shape a daemon without the table wrote.
   const legacy = new DatabaseSync(path)
+  dropCodeHostReplyTarget(legacy)
   legacy.exec('DROP TABLE thread_participation; PRAGMA user_version = 20;')
   legacy.close()
 
@@ -3080,6 +3168,7 @@ it.skipIf(pg)('upgrades a v17 store to durable memory continuations without chan
   await initial.close()
   const legacy = new DatabaseSync(path)
   dropBirthVerdict(legacy)
+  dropCodeHostReplyTarget(legacy)
   legacy.exec('DROP TABLE memory_entry_continuation; PRAGMA user_version = 17;')
   legacy.close()
   const upgraded = await openTestStore(path)
