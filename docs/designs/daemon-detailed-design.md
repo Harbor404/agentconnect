@@ -1098,11 +1098,12 @@ A second group is gated by a **declared port** rather than by a platform name
 (`platforms/read-ports.ts`, §7.1 of
 [integration-plugin-architecture.md](integration-plugin-architecture.md)): the bounded reads
 `getChannelHistory` and `getThreadHistory`, the reactions `addReaction` / `getReactions`,
-`createConversation`, `scheduleMessage`, and the canvas trio `createCanvas` / `readCanvas` /
-`updateCanvas`. Slack declares all of them today and is the only platform that does. The gate
+`deleteMessage`, `createConversation`, `scheduleMessage`, and the canvas trio `createCanvas` /
+`readCanvas` / `updateCanvas`. Slack declares all of them but `deleteMessage`, which Telegram
+declares. The gate
 is the **session's** platform, not the agent's integration list: a session on a declaring
-platform is injected the tools, and the same agent answering on Telegram, Discord, Feishu, or
-webchat is injected none — so these tools carry no `platform` selector at all, only the
+platform is injected that platform's tools, and the same agent answering where the port is
+undeclared is injected none of them — so these tools carry no `platform` selector at all, only the
 `integrationId` that picks another of the agent's bots on the same platform. The
 platform-neutral reads (`listChannels`, `listChannelMembers`, `getUserProfile`,
 `listKnownUsers`) and `sendMessage` keep their cross-platform `platform` argument; a
