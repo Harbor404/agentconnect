@@ -1,6 +1,7 @@
 # Per-Conversation Session Mode
 
-> Status: Proposed — not implemented.
+> Status: Implemented on the daemon and the Control Plane; the console control (§8) and the
+> unbounded transcript read (§10) are still outstanding. `auto` remains reserved (§12).
 > Scope: chat conversations that are channels, on every platform that has them, over
 > both daemon-owned and relay-forwarded ingress.
 > Primary implementation areas: `packages/protocol`, `packages/control-plane`,
@@ -399,11 +400,17 @@ and fan-out tests must pass unchanged against it before `append` uses it for any
 
 ### 7.1 In `append`: mint a new coordinate
 
-`!new` advances the reservation row by compare-and-set (§3.3) and writes a bare session
-row at the new coordinate, so the next message resolves to it immediately. The retired session keeps its row, its outward id, its
-CP metadata, and its transcript; the conversation simply stops adding to it, and it ages
-out through ordinary retention. Nothing is destroyed, and the successor's runtime session
-is born lazily, on the next message.
+`!new` advances the reservation row by compare-and-set (§3.3). Nothing else is written: the
+reservation is the authoritative source (§3.3) and no resolver consults the sessions table,
+so a bare row would serve nobody. The retired session keeps its row, its outward id, its CP
+metadata, and its transcript; the conversation simply stops adding to it, and it ages out
+through ordinary retention. Nothing is destroyed, and the successor's runtime session is
+born lazily, on the next message.
+
+Work already ADMITTED stays on the retired coordinate: it was resolved at ingress, so a
+running turn and anything queued behind it finish where they were admitted. That is the same
+rule §7.3 states for the in-flight turn, extended to the queue behind it, and it is why the
+reply says new messages rather than the next message.
 
 A session-isolated agent gets a **new workspace** with the new session, since workspace
 isolation is pinned when a logical session is created. That is the intended reading of
@@ -427,6 +434,30 @@ makes the next prompt replay the whole thread as catch-up (bounded by
 cursor to the moment it ran, so the replay window starts there and the session resumes
 from the `!new` point with nothing before it.
 
+**The cursor is a platform id, not a clock.** It is compared against the transcript's own
+`ts`, and the replay path discards a cursor its platform's ordering cannot parse — falling
+back to a full catch-up, which restores exactly what was cleared. So it is derived from the
+`!new` message itself, the way a turn derives its own coordinates, and a wall-clock stamp is
+wrong on every platform whose ids are not wall-clock shaped. Only Slack registers an ordering
+strategy; every other platform's cursor is compared as text, so it is only as good as its
+ids' lexical order — Feishu's opaque `om_` ids most obviously, but Telegram's per-chat
+numbers and Discord's snowflakes are compared the same way. That is a pre-existing property
+of every cursor in the transcript, not something this command introduces.
+
+Two guards the shape of this operation earns. The write is pinned on the runtime session id
+the command read, which narrows the check-then-act above it: a turn admitted in the window
+that minted a NEW id loses the pin. It does not cover a turn that kept the same id — that one
+read the row before the clear and its end-of-turn write restores what was cleared — so the
+command re-checks the gate afterwards and says so rather than reporting a success the user
+will not get. Closing this properly means running the clear under the session's own serial
+gate, as a zero-length turn, so a concurrent dispatch queues behind it; that is worth doing
+if the window turns out to matter in practice.
+
+And a `!new` that the latest-session fallback retargeted to another conversation is refused
+rather than performed — the reply lands on the command's own thread, so the people working in
+the cleared one would never be told. The refusal is checked BEFORE the in-flight one, or a
+retargeted command would be told to `!cancel` first, and `!cancel` retargets the same way.
+
 The cleared session is the same session afterwards: same key, so the same
 `session_outward_ids` row and the same console entry. The clear leaves **no console
 trace** — a deliberate choice, not an oversight.
@@ -443,7 +474,12 @@ trace** — a deliberate choice, not an oversight.
 
 ### 7.4 Authorization
 
-`commandSenderAllowed`, the same gate `!stop` takes, and **not** marked `runtimeChange` —
+`commandSenderAllowed`, the same gate `!stop` takes, plus the trusted-actor check `!resume`
+takes: `!new` discards a conversation's working context and cannot be undone, so a bot echo
+or a wrapper reporting no actor must not be able to forge it. The check is one predicate
+(`requiresTrustedActor`) applied at BOTH ingress paths — direct and relay — because relay is
+where the HTTP callbacks that can carry no actor at all arrive, and a gate on one path only
+is the failure mode this shape exists to prevent. **Not** marked `runtimeChange` —
 that flag guards Agent-level runtime settings behind an Agent editor, and `!new` changes
 no setting. No confirmation step. `logSessionAction('new', key, actor)` records who ran
 it, which is what that function exists for.

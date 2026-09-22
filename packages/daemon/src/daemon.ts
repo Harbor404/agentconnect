@@ -247,7 +247,7 @@ import {
   isUsableSourceDepth,
   routeRules
 } from './router/routing-table.js'
-import { parseCommand } from './commands/commands.js'
+import { parseCommand, requiresTrustedActor } from './commands/commands.js'
 import { CommandHandlers, type CommandHost } from './commands/handlers.js'
 import {
   rulesFromAgent,
@@ -7741,8 +7741,8 @@ export class Daemon {
       // Resetting a durable safety latch is privileged control input. A malformed
       // platform wrapper or bot echo must never be able to forge !resume and reopen
       // the same loop it caused.
-      if (command.kind === 'resume' && !isTrustedHumanTurn(msg)) {
-        this.log.warn(`loop guard: ignored unauthenticated resume for ${loopGuardScope(msg)}`)
+      if (requiresTrustedActor(command.kind) && !isTrustedHumanTurn(msg)) {
+        this.log.warn(`command: ignored unauthenticated ${command.kind} for ${loopGuardScope(msg)}`)
         return { kind: 'rejected', reason: 'suppressed' }
       }
       // §14.3: a command that resolved no admitted target in an Off gated
@@ -8386,8 +8386,10 @@ export class Daemon {
     // `!resume`, otherwise an open loop circuit drops the only recovery message.
     const command = parseCommand(normalized.text)
     if (command) {
-      if (command.kind === 'resume' && !isTrustedHumanTurn(normalized)) {
-        this.log.warn(`loop guard: ignored unauthenticated relay resume for ${loopGuardScope(normalized)}`)
+      // The same gate as direct ingress: relay is where Slack and Feishu HTTP callbacks
+      // arrive, so an event carrying neither a user nor a bot id lands here, not there.
+      if (requiresTrustedActor(command.kind) && !isTrustedHumanTurn(normalized)) {
+        this.log.warn(`command: ignored unauthenticated relay ${command.kind} for ${loopGuardScope(normalized)}`)
         return { msgId: msg.msgId, accepted: false, reason: 'unauthorized' }
       }
       const target = this.commands.resolveExplicitCommandTarget(msg.agentId, msg.integrationId, normalized)
