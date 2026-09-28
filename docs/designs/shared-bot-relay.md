@@ -643,9 +643,30 @@ unaffected.
 | elicitation, MCP App, `superseded` kinds | dropped                                                 |
 
 A rejected ack arrives before any output, so the relay answers it with an HTTP
-status instead of a stream: 409 for `busy`, 503 when the agent cannot take the
-turn now (`no_agent`, `paused`, `draining`), 502 otherwise, with the ack reason
-in the body. A daemon link that drops mid-turn ends the stream with `error`.
+status instead of a stream: 409 for `busy`, 422 for `declined`, 503 when the
+agent cannot take the turn now (`no_agent`, `paused`, `draining`), 502
+otherwise, with the ack reason in the body. A daemon link that drops mid-turn
+ends the stream with `error`.
+
+**Decision gate:** an added API can carry a Decision gate, a
+`ChannelDecisionGate` chain saved through
+`PUT /agents/:agentId/api/:protocol/gate` and stored in the agent's `apiGates`,
+keyed by protocol. The AgentSpec ships each gate with the Decisions its chain
+names, the way a code-host routing rides its host's spec, so admission reads
+nothing from the CP: editing one of those Decisions bumps and re-pushes the
+agent, and a gate whose condition no longer fits its Decision is left out of
+the spec until it is saved again. The relay marks each `/ai-sdk/chat` turn with
+`origin: 'ai-sdk-ui'`, and the daemon evaluates the chain on the turn's text
+where the op enters it, before a plain turn and a session-targeted continuation
+diverge and before anything is recorded. An answered no refuses the turn as
+`declined`; a match admits it; and, as with every chat gate
+([decisions.md §5](decisions.md#5-provider-execution-and-failure-behavior)), an
+evaluation that is unavailable, over capacity, or past its deadline, inside the
+relay's five-second acknowledgement, admits it. The daemon advertises
+`api-decision-gate-v1`, and the CP refuses to save a gate (409
+`DECISION_UNSUPPORTED_CONSUMER`) while a connected daemon serving the agent
+lacks it; an offline one takes the gate from its reconnect roster. Removing the
+API removes its gate, and a Decision a gate names cannot be deleted.
 
 Tool activity arrives as `data-tool` parts rather than AI SDK tool parts,
 because webchat carries a tool's title and status but not its name or

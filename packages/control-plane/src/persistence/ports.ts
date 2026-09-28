@@ -11,6 +11,7 @@
  */
 import type { MemoryHomeUpdate } from '../agent-memory/home.js'
 import type {
+  AgentApiGates,
   AgentApiProtocol,
   AuthReq,
   ProviderKeyProvider,
@@ -793,6 +794,7 @@ export interface UpdateAgentInput {
   mcpServers?: string[] | null // replaced wholesale when provided; null clears
   decisionIds?: string[] | null // replaced wholesale; null clears
   modelSelection?: AgentModelSelection | null
+  apiGates?: AgentApiGates | null // replaced wholesale; null or {} clears
   repositorySelector?: AgentRepositorySelector | null // null clears
   skills?: string[] | null // enabled skills; replaced wholesale when provided; null clears
   managedSkills?: string[] | null // accepted managed_skill ids; replaced wholesale when provided; null clears
@@ -839,6 +841,7 @@ export interface AgentRecord {
   mcpServers: string[] // from runtimeOverrides.mcpServers ([] when unset ⇒ none attached)
   decisionIds?: string[] // from runtimeOverrides.decisionIds; absent means none
   modelSelection?: AgentModelSelection
+  apiGates?: AgentApiGates // from runtimeOverrides.apiGates: the Decision gate on each chat API the agent added
   repositorySelector?: AgentRepositorySelector // from the repositorySelector* columns; absent means none
   skills: string[] // from runtimeOverrides.skills — enabled "<source>/<skill>" / "<source>/*" ([] ⇒ none)
   managedSkills: string[] // accepted managed_skill ids ([] ⇒ none)
@@ -5676,6 +5679,8 @@ export interface DecisionRepo {
     actor: ViewCtx
   ): Promise<{
     decision: import('@agentconnect.md/protocol').DecisionDefinition
+    /** Every agent whose chat API gate uses this Decision; each is bumped in the same tx, its spec carrying the Decision. */
+    consumerAgentIds: AgentId[]
     /** Every integration with a gate on this Decision; incompatible gates are marked Needs review in the same tx. */
     consumerIntegrationIds: IntegrationId[]
     /** Every bot whose router uses this Decision; incompatible routers are marked Needs review in the same tx. */

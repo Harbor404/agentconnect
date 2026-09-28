@@ -1,8 +1,10 @@
 // `/agents/:agentId/api` — the chat APIs an agent accepts calls on (shared-bot-relay.md §10.4).
 import { describe, it, expect, afterEach } from 'vitest'
+import { API_DECISION_GATE_V1_FEATURE } from '@agentconnect.md/protocol'
 import { prisma } from '../setup.db.js'
 import { buildHttpApp } from '../fakes/build-http.js'
-import { seedAgent } from '../fixtures/seed.js'
+import { seedAgent, seedDaemon } from '../fixtures/seed.js'
+import type { ControlSender } from '../../src/orchestrator/outbound.js'
 import { PgUserRepo } from '../../src/persistence/repositories/user.repo.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 
@@ -83,5 +85,112 @@ describe('agent chat APIs', () => {
     await add(a)
     await prisma.agent.delete({ where: { id: AGENT } })
     expect(await prisma.agentApiEntry.count()).toBe(0)
+  })
+})
+
+describe('agent chat API Decision gate', () => {
+  const DAEMON = 'd1d1d1d1-dddd-4ddd-8ddd-dddddddddddd'
+  const draft = {
+    name: 'On topic',
+    providerId: 'typesafe',
+    model: 'jev-1.13.0',
+    visibility: 'org',
+    sharedWith: [],
+    question: { type: 'boolean', instructions: 'Is it about the product?', criteria: { true: 'Yes', false: 'No' } }
+  }
+
+  /** An app whose daemon advertises `features`, capturing every AgentSpec it is sent. */
+  function gateApp(features: string[] = [API_DECISION_GATE_V1_FEATURE]) {
+    const specs: Array<{ apiGates?: unknown }> = []
+    const control = {
+      agentUpsert: async (_daemonId: string, u: { spec: { apiGates?: unknown } }) => {
+        specs.push(u.spec)
+      }
+    }
+    const liveness = { get: () => ({ state: 'READY', capabilities: { features } }) }
+    const a = buildHttpApp(prisma, undefined, liveness as never, control as unknown as ControlSender)
+    opened.push(a)
+    return { a, specs }
+  }
+  async function setup(features?: string[]) {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    const { a, specs } = gateApp(features)
+    const decision = (await a.app.inject({ method: 'POST', url: `${ORG}/decisions`, payload: draft })).json() as {
+      id: string
+    }
+    return { a, specs, decisionId: decision.id }
+  }
+  const gateOf = (decisionId: string) => ({ type: 'gate', decisionId, when: { type: 'boolean', values: [true] } })
+  const setGate = (a: HttpApp, gate: unknown) =>
+    a.app.inject({ method: 'PUT', url: `${ORG}/agents/${AGENT}/api/ai-sdk-ui/gate`, payload: { gate } })
+
+  it('saves a gate on an added API, lists it, ships it in the AgentSpec, and clears it', async () => {
+    const { a, specs, decisionId } = await setup()
+    expect((await setGate(a, gateOf(decisionId))).statusCode).toBe(404)
+    await add(a)
+
+    const saved = await setGate(a, gateOf(decisionId))
+    expect(saved.statusCode).toBe(200)
+    expect(saved.json()).toMatchObject({ protocol: 'ai-sdk-ui', gate: gateOf(decisionId) })
+    expect((await list(a)).json()).toMatchObject({ entries: [{ gate: gateOf(decisionId) }] })
+    // The spec carries the gate with its Decision, so the daemon admits without reading the CP.
+    expect(specs.at(-1)?.apiGates).toMatchObject({
+      'ai-sdk-ui': { gate: gateOf(decisionId), definitions: [{ id: decisionId, providerId: 'typesafe' }] }
+    })
+
+    expect((await setGate(a, null)).json()).toMatchObject({ gate: null })
+    expect(specs.at(-1)?.apiGates).toEqual({})
+  })
+
+  it('refuses a condition that does not fit the question, and a daemon that cannot run the gate', async () => {
+    const { a, decisionId } = await setup([])
+    await add(a)
+    const wrong = await setGate(a, { type: 'gate', decisionId, when: { type: 'score', min: 0, max: 2 } })
+    expect(wrong.statusCode).toBe(400)
+    const unsupported = await setGate(a, gateOf(decisionId))
+    expect(unsupported.statusCode).toBe(409)
+    expect(unsupported.json()).toMatchObject({ code: 'DECISION_UNSUPPORTED_CONSUMER' })
+    expect((unsupported.json() as { message: string }).message).toContain('Upgrade the daemon')
+    const hidden = await setGate(a, gateOf('44444444-4444-4444-8444-444444444444'))
+    expect(hidden.statusCode).toBe(404)
+    expect(hidden.json()).toMatchObject({ code: 'DECISION_NOT_FOUND' })
+  })
+
+  it('re-ships a gate when its Decision changes, and leaves out one whose condition no longer fits', async () => {
+    const { a, specs, decisionId } = await setup()
+    await add(a)
+    await setGate(a, gateOf(decisionId))
+    const edit = (question: unknown) =>
+      a.app.inject({ method: 'PATCH', url: `${ORG}/decisions/${decisionId}`, payload: { ...draft, question } })
+
+    specs.length = 0
+    expect((await edit({ ...draft.question, instructions: 'Is it about the product or its docs?' })).statusCode).toBe(
+      200
+    )
+    expect(specs.at(-1)?.apiGates).toMatchObject({
+      'ai-sdk-ui': { definitions: [{ question: { instructions: 'Is it about the product or its docs?' } }] }
+    })
+
+    // A boolean condition cannot judge a score question: the gate fails open until it is saved again.
+    const score = { type: 'score', instructions: 'How relevant?', criteria: ['low', 'high'] }
+    expect((await edit(score)).statusCode).toBe(200)
+    expect(specs.at(-1)?.apiGates).toEqual({})
+  })
+
+  it('keeps the Decision in use while the gate holds it, and releases it with the API', async () => {
+    const { a, decisionId } = await setup()
+    await add(a)
+    await setGate(a, gateOf(decisionId))
+    const detail = (await a.app.inject({ method: 'GET', url: `${ORG}/decisions/${decisionId}` })).json() as {
+      usages: Array<{ kind: string; id: string }>
+    }
+    expect(detail.usages).toContainEqual(expect.objectContaining({ kind: 'api_gate', id: AGENT }))
+    expect((await a.app.inject({ method: 'DELETE', url: `${ORG}/decisions/${decisionId}` })).statusCode).toBe(409)
+
+    expect((await remove(a)).statusCode).toBe(204)
+    const agent = await prisma.agent.findUniqueOrThrow({ where: { id: AGENT } })
+    expect((agent.runtimeOverrides as { apiGates?: unknown } | null)?.apiGates).toBeUndefined()
+    expect((await a.app.inject({ method: 'DELETE', url: `${ORG}/decisions/${decisionId}` })).statusCode).toBe(204)
   })
 })
