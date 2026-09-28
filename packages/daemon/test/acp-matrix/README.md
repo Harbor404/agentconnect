@@ -16,6 +16,8 @@ bundled shim), and runs only runtimes the image ships. It boots
 `sandbox.microsandbox.image` or `AC_RUNTIME_MATRIX_VM_IMAGE` names another; the msb
 package and image are cached under `$TMPDIR/acm-matrix` between runs.
 
+The latest recorded results are in [RESULTS.md](RESULTS.md).
+
 CI skips this suite. Run it locally with:
 
 ```bash
