@@ -292,7 +292,7 @@ import { LinearOrphanTokenSweeper } from './platforms/linear/orphan-token-sweepe
 import { linearConnectRoutes, linearOauthCallbackRoutes } from './platforms/linear/routes.js'
 import { createGoogleChatCpProvider, googleChatClaimAnchor } from './platforms/googlechat/provider.js'
 import { GoogleChatCredentialReconciler } from './platforms/googlechat/credential-reconciler.js'
-import { googleChatKeyRoutes } from './platforms/googlechat/routes.js'
+import { googleChatAppRoutes, googleChatKeyRoutes } from './platforms/googlechat/routes.js'
 import { googleChatClaimRoutes } from './platforms/googlechat/claim.js'
 import { slackInstallRoutes, slackConfigRoutes, slackOauthCallbackRoutes } from './http/routes/slack-install.js'
 import { slackPlatformInstallRoutes, slackPlatformCallbackRoutes } from './http/routes/slack-platform-install.js'
@@ -2293,7 +2293,12 @@ export function buildContainer(
     createGoogleChatCpProvider({
       fetch: googleChatSeams.fetch,
       installRoutes: {
-        org: [googleChatKeyRoutes(httpDeps, googleChatSeams), googleChatClaimRoutes(httpDeps, googleChatSeams)],
+        org: [
+          // The console offers the listing only where a claim can complete, so only with the anchor.
+          googleChatAppRoutes(googleChatAnchor && googleChatPlatformApp ? { app: googleChatPlatformApp } : {}),
+          googleChatKeyRoutes(httpDeps, googleChatSeams),
+          googleChatClaimRoutes(httpDeps, googleChatSeams)
+        ],
         publicCallback: []
       },
       ...(googleChatPlatformApp ? { app: googleChatPlatformApp } : {}),
