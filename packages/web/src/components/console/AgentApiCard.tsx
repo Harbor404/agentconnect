@@ -10,10 +10,12 @@ import { ConfirmationDialog } from '@/components/console/ConfirmationDialog'
 import { ApiKeyFormModal, MY_KEYS, type ApiKeyOwner } from '@/components/console/ApiKeysCard'
 import { MOCK_MODE, agentLabel, type Agent } from '@/lib/data'
 import { useOrgs } from '@/lib/org-context'
+import { useIsMobile } from '@/lib/use-is-mobile'
 import { consoleKeys } from '@/lib/swr-keys'
 import { agentApiRelayUrl, agentChatUrls, aiSdkProxySnippet, API_PROTOCOLS, apiProtocolLabel } from '@/lib/agent-api'
 import { useOptionalDecisionsPrototype } from '@/lib/decisions/provider'
 import type { SavedGate } from '@/lib/decisions/binding'
+import { apiGateEvaluations } from '@/lib/decisions/evaluation-source'
 import { DecisionBindingStrip, DecisionGateEntry } from '@/components/console/decisions/DecisionBindingStrip'
 import type { ChannelDecisionGate } from '@agentconnect.md/protocol/decision'
 import {
@@ -159,6 +161,8 @@ function ApiRow({
     onChanged()
   }
   const padX = mobile ? 16 : 14
+  // Agent detail mounts a mobile and a desktop card; only the visible one owns the strip, so its dialog portals once.
+  const ownsStrip = useIsMobile() === mobile
   return (
     <>
       <div
@@ -180,7 +184,7 @@ function ApiRow({
           {t('quickstart')}
         </Button>
       </div>
-      {decisions && (saved || decisions.bindingDrafts[bindingKey]) && (
+      {decisions && ownsStrip && (saved || decisions.bindingDrafts[bindingKey]) && (
         <DecisionBindingStrip
           bindingKey={bindingKey}
           conversation={null}
@@ -191,6 +195,10 @@ function ApiRow({
           saved={saved}
           status={saved ? 'ready' : null}
           surface="api"
+          // Only those who can edit the agent read the calls its gate judged.
+          {...(agent.canEdit
+            ? { evaluations: apiGateEvaluations(decisions.api, decisions.orgId, agent.id, entry.protocol) }
+            : {})}
           onSave={(gate) => saveGate(gate)}
         />
       )}
@@ -314,7 +322,7 @@ function QuickstartDialog({
 
   return (
     <div className="scrim">
-      <div className="modal" role="dialog" aria-modal="true" aria-label={t('quickstart')}>
+      <div className="modal max-w-[920px]" role="dialog" aria-modal="true" aria-label={t('quickstart')}>
         <div className="modalhead">
           <span className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] bg-(--brand-soft)">
             <Icon name="code-xml" size={16} color="var(--brand)" />
