@@ -39,6 +39,9 @@ export interface WebchatVerificationDeps {
       orgId: string
       agentId: string
       platform: string | null
+      tenantScope?: string | null
+      channel?: string | null
+      thread?: string | null
       daemonId: string | null
       contentSetId: string | null
       visibility: string
@@ -135,10 +138,12 @@ export function webchatBinding(
       ) {
         return { ok: false, reason: 'continuation unavailable' }
       }
-      // Single fixed participant; no roster growth, no remote MCP entitlement.
+      // No roster growth and no remote MCP entitlement; a hook target also brings its conversation's other members (#2500).
+      const peers =
+        originKindOf(session.platform ?? '') === 'hook' ? await hookConversationPeers(deps, session, claims) : []
       return {
         ...verifiedBase,
-        participants: [{ agentId: claims.agentId, daemonId: agentDaemonId, primary: true }],
+        participants: [{ agentId: claims.agentId, daemonId: agentDaemonId, primary: true }, ...peers],
         targetSessionId
       }
     }
@@ -197,6 +202,48 @@ export function webchatBinding(
     })
     return entitlement ? { ...verified, remoteMcp: entitlement } : verified
   }
+}
+
+/** The peers mint authorized for a hook target's merged conversation (#2500), each re-checked like the target and kept as a participant carrying its own session; one that drifted is left out rather than failing the token. */
+async function hookConversationPeers(
+  deps: Omit<WebchatVerificationDeps, 'tokens'>,
+  target: { platform: string | null; tenantScope?: string | null; channel?: string | null; thread?: string | null },
+  claims: WebchatTokenClaims
+): Promise<RcWebchatParticipant[]> {
+  const peers: RcWebchatParticipant[] = []
+  for (const claimed of claims.conversationPeers ?? []) {
+    const peer = await deps.sessions.getUnscoped(SessionId(claimed.sessionId))
+    if (!peer || peer.orgId !== claims.orgId || peer.agentId === claims.agentId) continue
+    if (peers.some((p) => p.agentId === peer.agentId)) continue
+    const sameConversation =
+      peer.platform === target.platform &&
+      (peer.tenantScope ?? null) === (target.tenantScope ?? null) &&
+      peer.channel === target.channel &&
+      peer.thread === target.thread
+    if (!sameConversation || peer.contentPurgedAt !== null || !continuableOrigin(peer.platform ?? '')) continue
+    if (
+      peer.visibility === 'private' &&
+      (peer.ownerIdentity === null || peer.ownerIdentity !== claimed.privateOwnerIdentity)
+    ) {
+      continue
+    }
+    const agent = await deps.agents.getUnscoped(AgentId(peer.agentId))
+    if (!agent || agent.orgId !== claims.orgId) continue
+    const daemonId = await deps.placement.dispatchDaemon(agent)
+    const daemon = daemonId ? deps.daemons.get(daemonId) : undefined
+    if (!daemonId || daemon?.state !== 'READY') continue
+    const features = daemon.capabilities?.features ?? []
+    if (
+      !features.includes(WEBCHAT_SESSION_CONTINUATION_FEATURE) ||
+      !features.includes(WEBCHAT_HOOK_CONTINUATION_FEATURE)
+    ) {
+      continue
+    }
+    const sharedStoreMembers = peer.contentSetId ? await deps.memberSets.sharedStoreMemberIdsOf(peer.contentSetId) : []
+    if (!servesSessionContent({ recordedDaemonId: peer.daemonId, sharedStoreMembers }, daemonId)) continue
+    peers.push({ agentId: peer.agentId, daemonId, targetSessionId: claimed.sessionId })
+  }
+  return peers
 }
 
 export interface ContentReachDeps {

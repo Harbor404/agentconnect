@@ -1229,6 +1229,110 @@ describe('webchat verification — session-targeted continuation (webchat-cross-
     await expect(capable.verifier('t')).resolves.toMatchObject({ ok: true, targetSessionId: TARGET_SESSION_ID })
   })
 
+  // #2500: a hook target brings the other members of its merged conversation, each addressed at its own session.
+  describe('a hook target’s merged conversation', () => {
+    const PEER = '77777777-7777-4777-8777-777777777777'
+    const OFFLINE_PEER = '88888888-8888-4888-8888-888888888888'
+    const OFFLINE_DAEMON = '99999999-9999-4999-8999-999999999999'
+    const HOOK_FEATURES = [...CONTINUATION_FEATURES, WEBCHAT_HOOK_CONTINUATION_FEATURE]
+    const onPullRequest = { platform: 'hook', channel: 'github:42', thread: '1552' }
+    const peer = (agentId: string, over: Record<string, unknown> = {}) => ({
+      ...targetSession({ agentId, ...onPullRequest }),
+      ...onPullRequest,
+      ...over
+    })
+    // Mint ran the full continuation and agent-visibility gates (#2500); verify only re-checks what can drift.
+    const hookTarget = (
+      peers: Array<{ sessionId: string; privateOwnerIdentity?: string }>,
+      sessions: Record<string, ReturnType<typeof peer>>,
+      over: Parameters<typeof buildWebchatVerifier>[0] = {}
+    ) =>
+      buildWebchatVerifier({
+        tokenClaims: {
+          userId: 'user-1',
+          user: 'user@example.test',
+          agentId: WEBCHAT_AGENT_ID,
+          orgId: 'org-1',
+          conversationId: WEBCHAT_CONVERSATION_ID,
+          conversationPeers: peers
+        },
+        conversationRow: { targetSessionId: TARGET_SESSION_ID },
+        sessionById: { [TARGET_SESSION_ID]: peer(WEBCHAT_AGENT_ID), ...sessions },
+        daemonFeatures: HOOK_FEATURES,
+        ...over
+      })
+
+    it('adds each peer mint authorized with its own target, after the primary', async () => {
+      const h = hookTarget([{ sessionId: 'peer-session' }], { 'peer-session': peer(PEER) })
+      await expect(h.verifier('t')).resolves.toMatchObject({
+        ok: true,
+        targetSessionId: TARGET_SESSION_ID,
+        participants: [
+          { agentId: WEBCHAT_AGENT_ID, daemonId: WEBCHAT_DAEMON_ID, primary: true },
+          { agentId: PEER, daemonId: WEBCHAT_DAEMON_ID, targetSessionId: 'peer-session' }
+        ]
+      })
+    })
+
+    it('leaves out a peer that drifted, moved conversation, lost its owner, or went offline', async () => {
+      const h = hookTarget(
+        [
+          { sessionId: 'purged-session' },
+          { sessionId: 'other-pr-session' },
+          { sessionId: 'private-session', privateOwnerIdentity: 'github:1' },
+          { sessionId: 'offline-session' }
+        ],
+        {
+          'purged-session': peer(PEER, { contentPurgedAt: new Date() }),
+          'other-pr-session': peer(PEER, { thread: '1553' }),
+          'private-session': peer(PEER, { visibility: 'private', ownerIdentity: 'github:2' }),
+          'offline-session': peer(OFFLINE_PEER)
+        },
+        {
+          agentById: {
+            [OFFLINE_PEER]: {
+              id: AgentId(OFFLINE_PEER),
+              orgId: 'org-1',
+              placementKind: 'daemon',
+              setId: null,
+              daemonId: OFFLINE_DAEMON
+            }
+          },
+          daemonById: { [OFFLINE_DAEMON]: { state: 'OFFLINE', features: HOOK_FEATURES } }
+        }
+      )
+      const result = await h.verifier('t')
+      expect(result.participants).toEqual([{ agentId: WEBCHAT_AGENT_ID, daemonId: WEBCHAT_DAEMON_ID, primary: true }])
+    })
+
+    it('keeps a private peer whose owner mint proved', async () => {
+      const h = hookTarget([{ sessionId: 'private-session', privateOwnerIdentity: 'github:1' }], {
+        'private-session': peer(PEER, { visibility: 'private', ownerIdentity: 'github:1' })
+      })
+      const result = await h.verifier('t')
+      expect(result.participants?.map((p) => p.targetSessionId)).toEqual([undefined, 'private-session'])
+    })
+
+    it('never expands a chat-origin target, whose mirror would post one line per member', async () => {
+      const h = targeted(
+        {},
+        {
+          tokenClaims: {
+            userId: 'user-1',
+            user: 'user@example.test',
+            agentId: WEBCHAT_AGENT_ID,
+            orgId: 'org-1',
+            conversationId: WEBCHAT_CONVERSATION_ID,
+            conversationPeers: [{ sessionId: 'peer-session' }]
+          },
+          sessionById: { [TARGET_SESSION_ID]: targetSession(), 'peer-session': targetSession({ agentId: PEER }) }
+        }
+      )
+      const result = await h.verifier('t')
+      expect(result.participants).toHaveLength(1)
+    })
+  })
+
   it('keeps private sessions owner-only using the exact mint-time identity proof', async () => {
     await expect(
       targeted(

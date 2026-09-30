@@ -11,10 +11,12 @@
  * token; the relay verifies it via `rc/verify(webchat-token)` and bridges to the agent's
  * daemon. This is the ONLY authentication the relay path needs — the CP never sees content.
  */
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import { continuableOrigin, WEBCHAT_MULTI_AGENT_FEATURE } from '@agentconnect.md/protocol'
+import { continuableOrigin, originKindOf, WEBCHAT_MULTI_AGENT_FEATURE } from '@agentconnect.md/protocol'
+import type { SessionMetaRecord } from '../../persistence/ports.js'
+import { MAX_CONVERSATION_PEERS, type ConversationPeerClaim } from '../../registry/webchatToken.js'
 import type { ZodTypeProvider } from '../plugins/zod.js'
 import type { HttpDeps } from '../deps.js'
 import { AgentId, SessionId, type OrgId } from '../../domain/ids.js'
@@ -63,6 +65,41 @@ export function webchatTokenRoutes(deps: HttpDeps) {
   return async function webchatTokenRoutesPlugin(app: FastifyInstance): Promise<void> {
     const r = app.withTypeProvider<ZodTypeProvider>()
     const sessionAccess = makeSessionAccessResolver(deps)
+
+    /** The other agents' sessions of a hook session's merged conversation the caller may continue, under the same gates as this mint and the detail read's `canContinue` (#2500). */
+    const hookConversationPeers = async (
+      req: FastifyRequest,
+      s: SessionMetaRecord
+    ): Promise<ConversationPeerClaim[]> => {
+      if (originKindOf(s.platform ?? '') !== 'hook' || !s.platform || s.channel === null || s.thread === null) return []
+      const ctx = ctxOf(req)
+      const orgAgents = await deps.repos.agent.list(orgOf(req))
+      const agentIds = orgAgents.map((a) => a.id)
+      const scoped = await sessionAccess.forQuery(req, { agentIds })
+      const viewer = { role: ctx.role, identitySet: [...scoped.identitySet], externalAccess: scoped.externalAccess }
+      const key = { platform: s.platform, tenantScope: s.tenantScope, channel: s.channel, thread: s.thread }
+      const members = (await deps.repos.session.listConversationMembers({ agentIds, viewer }, key)).filter(
+        (m) => m.agentId !== s.agentId
+      )
+      if (members.length === 0) return []
+      const access = await sessionAccess.forSessions(req, members)
+      const agentsById = new Map(orgAgents.map((a) => [a.id as string, a]))
+      const peers: ConversationPeerClaim[] = []
+      for (const m of members) {
+        // Newest first, so a conversation larger than a verdict can carry keeps its most recently active members.
+        if (peers.length >= MAX_CONVERSATION_PEERS) break
+        if (!canContinueSession(m, ctx, access.identitySet, access.externalAccess)) continue
+        if (m.contentPurgedAt || !continuableOrigin(m.platform ?? '')) continue
+        const peerAgent = agentsById.get(m.agentId)
+        if (!peerAgent || !canView(peerAgent, ctx)) continue
+        if (!(await resolveContinuationHost(deps, m, peerAgent)).ok) continue
+        peers.push({
+          sessionId: m.id,
+          ...(m.visibility === 'private' && m.ownerIdentity ? { privateOwnerIdentity: m.ownerIdentity } : {})
+        })
+      }
+      return peers
+    }
 
     /** The identity the token attests: the handle names transcript lines and session branches, so the full name beats the sign-in address. */
     const authorIdentity = (userId: string, email: string | undefined) =>
@@ -256,13 +293,15 @@ export function webchatTokenRoutes(deps: HttpDeps) {
           { orgId: agent.orgId, agentId: agent.id, userId },
           s.id
         )
+        const conversationPeers = await hookConversationPeers(req, s)
         const { token, expiresAt } = await deps.webchatTokens.mint({
           userId,
           ...(await authorIdentity(userId, req.principal!.email)),
           agentId: agent.id,
           orgId: agent.orgId,
           conversationId,
-          ...(s.visibility === 'private' && s.ownerIdentity ? { privateSessionOwnerIdentity: s.ownerIdentity } : {})
+          ...(s.visibility === 'private' && s.ownerIdentity ? { privateSessionOwnerIdentity: s.ownerIdentity } : {}),
+          ...(conversationPeers.length > 0 ? { conversationPeers } : {})
         })
         return reply.send({ token, relayUrl, conversationId, expiresAt: expiresAt.toISOString() })
       }

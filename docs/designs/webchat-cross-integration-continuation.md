@@ -1,6 +1,6 @@
 # Webchat Continuation of Other Integrations' Sessions
 
-**Status:** Implemented (v1 chat origins, v2 hook origins — §9)
+**Status:** Implemented (v1 chat origins, v2 hook origins — §9, v3 multi-agent hook conversations — §10)
 **Owner:** console/web + control plane + relay + daemon
 **Related:** issue #180 (webchat could continue other integration's session),
 [webchat-multi-agents.md](webchat-multi-agents.md),
@@ -89,7 +89,7 @@ deployments fail closed behind daemon and relay capability gates.
   composer is not (it composes with
   [merged-conversation-view.md](merged-conversation-view.md) later). Ordinary
   platform-side activation of agents already participating in that thread is
-  not adoption and follows §5.2.
+  not adoption and follows §5.2. **Superseded for hook-origin targets by §10.**
 - **No continuation of `hook`/`dream`/`a2a` sessions.** v1 targets chat-origin
   sessions (`originKindOf(platform) === 'chat'`,
   `packages/protocol/src/frames/route.ts:43-60`). Headless-origin sessions have
@@ -658,7 +658,64 @@ and takes the chat path — including its mirror, which cannot land. That
 misclassification predates this design and belongs to the schedule/session
 identity work, not here.
 
-## 10. Open questions
+## 10. Multi-agent hook conversations (v3)
+
+The merged conversation page ([merged-conversation-view.md](merged-conversation-view.md)
+§8) groups every agent's session on one pull request into a single conversation. v3 lets
+its composer address that conversation as multi-agent webchat does
+([webchat-multi-agents.md](webchat-multi-agents.md) §4.2). A message goes to the members
+it @-mentions. A message that mentions nobody goes to every continuable member. Members
+the message does not address receive nothing: hook-origin member sessions are
+independent of each other, so there is no transcript-only `context` copy.
+
+**No new route or row.** The console still mints the representative's session-targeted
+token (§6.2). A hook-origin session's `platform/tenantScope/channel/thread` already names
+its conversation, so that mint also selects the conversation's peers.
+
+- **Mint.** It reads the caller's visible current session per agent
+  (`listConversationMembers`). It keeps each other member that passes the same gates the
+  detail read's `canContinue` applies: `canContinueSession` with provider access, un-purged
+  content, `canView` on the agent, and `resolveContinuationHost`. The kept members go into
+  the token as `conversationPeers`, each with its proven private owner.
+- **Verify.** `rc/verify` re-checks each claimed peer the way it re-checks the target:
+  - same conversation and org;
+  - un-purged content;
+  - private owner unchanged;
+  - served by a READY dispatch daemon that advertises both continuation bits.
+
+  Each peer that still passes becomes a participant carrying its own
+  `RcWebchatParticipant.targetSessionId`. A peer that drifted is left out rather than
+  failing the token.
+
+A member that joins later becomes addressable on the next mint, which happens at most one
+token TTL later. A chat-origin target never expands: its mirror (§5.2) would post one line
+to the thread once per member.
+
+**Relay.** A participant's own `targetSessionId` wins over the connection's, and
+`selectTurnTargets` with its shared `post {postId, at}` is unchanged. Neither user-turn
+nor agent-post context fan-out reaches a participant that carries a target.
+
+**Daemon.** A hook-origin continuation turn keeps the relay's `post`. Its `at` becomes
+the human row's `ts` and its `postId` the row's `postId`, and the ingest probes the slot
+as webchat does, so two members co-hosted on one daemon share one row.
+
+**Web.**
+
+- A hook-origin merged conversation whose representative can continue drops the chip
+  pick and sends with the roster of members whose own session can continue, so a bare
+  send materializes the standing mention.
+- `duplicateIdentity` dedupes on `postId` for any platform, so the line renders once.
+- A chat-origin conversation keeps the one-member pick.
+
+**Rollout.** No capability bit is added.
+
+- An older relay stamps the representative's target on every participant. The daemon's
+  agent-scoped lookup then refuses a peer's turn as `not_found`, so the turn fails
+  closed and never reaches a fresh webchat session.
+- An older daemon ignores `post`, so its copy of the line renders a second time until
+  it upgrades.
+
+## 11. Open questions
 
 1. **Mirror rendering** — Slack now renders the human turn under the author's
    own identity (§5.2); the attributed fallback (`[<user> via console]`) remains
