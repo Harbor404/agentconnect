@@ -18,9 +18,9 @@ credentials, route metadata, relay rosters, and revocations over control
 channels. Live message ingress, attachments, replies, and ACP output streams do
 not traverse it. Separately, an authorized Web UI request may cause the CP to
 proxy a bounded daemon-local transcript, tool-body, memory, or workspace read
-without persisting the response. This preserves the hot-path boundary in
-[architecture.md](architecture.md): established
-message and agent-execution paths can continue while CP is unavailable.
+without persisting the response. This preserves the data-plane boundary in
+[architecture.md](architecture.md); admission and turn control dependencies
+remain subject to the [availability contract](high-availability.md).
 
 ## 1. Protocol Model
 
@@ -921,6 +921,25 @@ delivery.
 
 ## 13. Architectural Degradation Semantics
 
+The table describes degradation paths within the current control-loss limits.
+Relay readiness follows the CP link; with the chart's probes, roughly 20–30
+seconds without READY removes the relay from Service endpoints. CP roster
+expiry is currently 45 seconds, after which daemons can lose that relay route.
+Reconnect also clears memory bindings before asynchronous replay, while MCP
+and hook replay is additive. Existing connections alone do not establish
+uninterrupted service through those transitions.
+
+The proposed [CP rollout contract](high-availability.md#planned-rollout-and-reconnect-budget)
+requires bounded waiting for all control-dependent verification/lookups,
+bounded data-plane readiness through handoff, and atomic replacement snapshots.
+When no CP can renew, it also requires established relay links to preserve
+cached, authorized ingress in a non-authoritative control mode; new control
+authority remains unavailable. A lost control link has bounded readiness grace;
+longer preservation requires explicit non-authoritative mode and observable live
+daemon routes ([readiness rules](high-availability.md#owner-failure-and-database-loss)).
+Those changes are prerequisites, not existing
+guarantees. Relay crash-delivery and replay guarantees remain unchanged.
+
 | Failure                             | HTTP bot ingress                                                                                               | Hook ingress                                                     | Webchat                                                            | Agent API egress                              |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------- |
 | CP unavailable                      | Cached assignments and existing daemon sockets continue; affinity misses and new authentication fail closed    | Cached rules continue; metadata reports may wait or fail visibly | Established sessions continue; new verification is unavailable     | Continues directly from online daemons        |
@@ -967,11 +986,11 @@ strict log redaction.
 
 - Slack and Lark / Feishu HTTP apps use the stable public relay origin for their
   callback request URLs.
-- Relay readiness must cover the public listener, CP projection state, and the
-  daemon-facing listener. A process should become unready before draining
-  sockets.
-- Registration and reconnect trigger authoritative replay. Incremental frames
-  are an optimization, not the only reconstruction mechanism.
+- Current readiness covers listeners and CP-link READY. The proposed CP handoff
+  separates a previously converged data plane from transient link loss within
+  its bounded grace; initial startup still requires a complete projection.
+- Registration and reconnect trigger replay; complete atomic replacement is
+  an HA requirement that the current MCP/hook and memory paths do not yet meet.
 - `daemonUrl` must be independently routable to its registered relay identity.
 - The pool must expose delivery-drop counters, control connection state,
   connected-daemon counts, signature failures, and assignment counts without

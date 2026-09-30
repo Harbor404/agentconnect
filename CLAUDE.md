@@ -18,8 +18,11 @@ adding or reusing a diagram or screenshot, inspect its visible text and verify
 that it still matches the current architecture. Prefer diffable SVG or Mermaid
 source over opaque raster diagrams.
 
-The defining architectural choice: **the Control Plane is never on the message hot
-path.** Agent execution always happens inside a daemon on the data plane. Where
+The defining architectural choice: **live platform message bodies and ACP update
+streams stay on the daemon/relay data plane.** Some admission steps and turn
+operations require CP control RPCs; their recovery requirements are defined in
+[high-availability.md](docs/designs/high-availability.md). Agent execution always
+happens inside a daemon on the data plane. Where
 that daemon runs is a deployment choice, not part of the invariant — self-hosted
 on machines the organization operates, or a member of the install's managed
 Kubernetes pool (Cloud), which shares one PostgreSQL data plane and launches
@@ -31,8 +34,10 @@ public callback endpoint is required; the CP only orchestrates. Concretely:
   and agent execution over **ACP the Control Plane never sees** (local IPC self-hosted;
   one in-cluster dial to the sandbox pod in the pool).
   It also accepts pre-addressed public ingress from the relay. It is a self-contained
-  "message + agent execution unit" and keeps running established sessions even if the
-  CP is down (graceful degradation).
+  "message + agent execution unit" and keeps running established sessions during CP
+  outages within their [authority lifetimes](docs/designs/high-availability.md#authority-lifetimes).
+  All member-set daemons self-fence duties at `T_fence` after the last confirmed
+  renewal; see [the duty lease contract](docs/designs/k8s-daemon-pool.md#5-the-duty-ledger-and-lease-service-d6-d7).
 - The optional **relay** terminates Slack HTTP callbacks, GitHub and GitLab webhooks,
   generic webhooks, and webchat, then forwards content directly to the owning
   daemon. It does not persist message content.
@@ -40,11 +45,11 @@ public callback endpoint is required; the CP only orchestrates. Concretely:
   stores **only control-plane metadata** — never message bodies, ACP `session/update`
   streams, or attachment bytes. Managed agent memory with `home: control-plane` is
   the one curated-content exception, like organization knowledge. Authorized BFF
-  reads may proxy bounded transcript, tool-body, memory, or workspace content from
-  the owning daemon without persisting it.
+  operations may proxy bounded transcript, tool-body, memory, or workspace reads
+  and workspace writes to the owning daemon without persisting their content.
 - daemon ↔ CP is a single **WebSocket** used primarily for control signaling
   (register, heartbeat, orchestration commands, telemetry). It also carries the
-  scoped request/reply frames for those on-demand BFF reads; live platform
+  scoped request/reply frames for those on-demand BFF operations; live platform
   messages and ACP update streams never use it.
 
 ## Monorepo (pnpm workspace, `packages/*`)
