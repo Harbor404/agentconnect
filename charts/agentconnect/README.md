@@ -70,8 +70,10 @@ helm install agentconnect oci://ghcr.io/agentconnect-md/charts/agentconnect \
 ## Requirements
 
 - **Kubernetes >= 1.28** (the relay reads the `apps.kubernetes.io/pod-index` label).
-- **PostgreSQL** you operate, reachable as `DATABASE_URL`. Migrations run in an init
-  container on Control Plane startup (`migrate.enabled`).
+- **PostgreSQL** you operate, reachable as `DATABASE_URL`. Migrations run once per
+  install and upgrade in a pre-install/pre-upgrade hook Job, before any new Control Plane
+  pod starts (`migrate.enabled`). Helm waits for that Job, so give a release with a long
+  migration a longer `--timeout`.
 - **Cluster-scoped install rights** by default: the daemon pool renders the TokenReview
   ClusterRole/Bindings, the agent-sandbox CRDs ship in the chart's `crds/` directory
   (applied on first install, skipped when present, never upgraded or deleted by Helm —
@@ -97,3 +99,26 @@ kubectl -n agentconnect port-forward deployment/agentconnect-setup-server 8091:8
 
 The full self-hosting walkthrough (authentication, public URLs, provider apps, image
 pinning) is the [AgentConnect OSS guide](https://www.agentconnect.md/docs/self-hosting).
+
+## Node maintenance
+
+The Control Plane runs as one replica, and it also serves the API. Evicting its pod, as a
+node drain does, leaves the API unavailable until the replacement is ready — several
+seconds. A rolling update has no such gap: its replacement is ready, and has had
+`controlPlane.minReadySeconds` for the Gateway to find it, before the old pod stops.
+
+Set `controlPlane.podDisruptionBudget=true` so a drain cannot evict the Control Plane pod,
+and move the pod with a rolling update before draining its node:
+
+```bash
+kubectl cordon <node>
+kubectl -n agentconnect rollout restart deployment/agentconnect-control-plane
+kubectl -n agentconnect rollout status deployment/agentconnect-control-plane
+kubectl drain <node> --ignore-daemonsets
+```
+
+Cordoning first makes the replacement start on another node, and waiting for the rollout to
+finish keeps the old pod serving through that settling window. If a drain is already waiting
+on the Control Plane pod, stop it before the restart: the budget counts the replacement as
+available as soon as it is Ready, so a waiting drain would evict the old pod before the
+window ends. Leave the budget off where nobody can act on a drain that is waiting.
