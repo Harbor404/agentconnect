@@ -124,6 +124,12 @@ function validateBundleUris(args: string[]): void {
       seen = true
       continue
     }
+    const option = argument.includes('=') ? argument.slice(0, argument.indexOf('=')) : argument
+    // Git accepts unique long-option prefixes. `--bu=` reaches the same clone option as the full
+    // spelling, so accepting only the complete token would make the HTTPS rule bypassable.
+    if (option.length > 2 && BUNDLE_URI.startsWith(option)) {
+      refuse(`argument ${argument} is not an accepted bundle URI spelling`)
+    }
     if (argument.startsWith(BUNDLE_URI)) refuse(`argument ${argument} is not an accepted bundle URI spelling`)
   }
   if (seen && subcommand !== 'clone') refuse(`${BUNDLE_URI} is only permitted for git clone`)
@@ -157,6 +163,23 @@ function canonicalPotential(path: string): string {
   }
 }
 
+function canonicalStagingRoot(stagingRoot: string): string {
+  const absolute = normalize(resolve(stagingRoot))
+  let stat
+  try {
+    stat = lstatSync(absolute)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') refuse('bundle staging root does not exist')
+    refuse(`cannot inspect bundle staging root: ${stagingRoot}`)
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) refuse('bundle staging root must be a real directory')
+  try {
+    return realpathSync(absolute)
+  } catch {
+    refuse(`cannot resolve bundle staging root: ${stagingRoot}`)
+  }
+}
+
 function validateBundleFile(stagingRoot: string | undefined, file: string): void {
   if (!stagingRoot) refuse('bundle create requires a staging root')
   if (!isAbsolute(file)) refuse('bundle output file must be absolute')
@@ -171,7 +194,7 @@ function validateBundleFile(stagingRoot: string | undefined, file: string): void
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 
-  const root = canonicalPotential(stagingRoot)
+  const root = canonicalStagingRoot(stagingRoot)
   const target = canonicalPotential(file)
   if (target === root || !target.startsWith(root + sep)) refuse(`bundle output escapes the staging root: ${file}`)
   const relative = target.slice(root.length + sep.length)

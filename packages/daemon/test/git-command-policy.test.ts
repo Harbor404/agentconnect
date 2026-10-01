@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'vitest'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { validateGitArgs } from '../src/workspace/git-command-policy.js'
@@ -65,6 +65,8 @@ describe('Git command policy', () => {
       ['clone', '--bundle-uri', '--filter=blob:none', remote, 'repo'],
       ['clone', '--bundle-uri', 'ssh://git@example.test/repo', remote, 'repo'],
       ['clone', '--bundle-urihttps://cache.example.test/repo.bundle', remote, 'repo'],
+      ['clone', '--bu=file:///etc/passwd', remote, 'repo'],
+      ['clone', '--bundle-u', 'file:///etc/passwd', remote, 'repo'],
       [
         'clone',
         '--bundle-uri=https://cache.example.test/one.bundle',
@@ -131,6 +133,10 @@ describe('Git command policy', () => {
     refused(['bundle', 'create', join(stagingRoot, 'linked-outside', 'escape.bundle'), 'refs/heads/main'], stagingRoot)
     symlinkSync(outsideFile, join(stagingRoot, 'linked-file.bundle'))
     refused(['bundle', 'create', join(stagingRoot, 'linked-file.bundle'), 'refs/heads/main'], stagingRoot)
+
+    renameSync(stagingRoot, join(root, 'staging-real'))
+    symlinkSync(outside, stagingRoot)
+    refused(['bundle', 'create', join(stagingRoot, 'root-replacement.bundle'), 'refs/heads/main'], stagingRoot)
   })
 
   it('refuses refs that read as options, revisions, or injected commands', () => {
