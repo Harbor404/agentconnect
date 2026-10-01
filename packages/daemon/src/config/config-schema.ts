@@ -6,7 +6,6 @@ import {
   SESSION_RETENTION_RE,
   type SessionRetentionSetting
 } from '@agentconnect.md/protocol'
-import { SourceCacheConfigSchema } from '../source-cache/config.js'
 
 /** The `{name, value}[]` shape shared by runtime env, MCP env, and MCP headers. */
 const NameValueList = z.array(z.object({ name: z.string(), value: z.string() })).default([])
@@ -247,9 +246,6 @@ export const ConfigSchema = z.object({
   // degradation); the CP's register/ok snapshot re-converges it authoritatively once
   // connected. CP-owned — overwritten on every roster converge, not hand-edited.
   relays: z.array(RelayRosterEntry).default([]),
-  // Optional Source Cache. Absence is the disabled no-op; the environment document is
-  // parsed by loadConfig and never exposed to sandboxes or the control plane.
-  sourceCache: SourceCacheConfigSchema.optional(),
   logging: z
     .object({ level: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info') })
     .default({ level: 'info' }),

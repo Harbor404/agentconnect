@@ -610,14 +610,18 @@ default_member = find.call('Deployment', 'example-agentconnect-daemon-pool')
                      .dig('spec', 'template', 'spec', 'containers', 0).fetch('env').map { |item| item.fetch('name') }
 abort('an unset grace must leave both sides on the daemon default') if default_member.include?('AC_K8S_ORPHAN_GRACE_MS')
 
-# Source Cache is a daemon-pool member capability only. The default has no bucket configured, so
-# it must render no source-cache environment at all; enabling Secret credentials must project
-# values by reference, never inline, and must stay out of reconciler/sandbox objects.
+# Source Cache is a daemon-pool member capability only. The member reads a fixed document from
+# a ConfigMap; static credentials are Secret files, never environment variables or Config arms.
+source_cache_name = 'example-agentconnect-source-cache'
+default_documents = documents
+abort('source Cache must be off by default') if default_documents.any? do |doc|
+  doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == source_cache_name
+end
 abort('source Cache must be off by default') if container.fetch('env').any? { |item| item.fetch('name').start_with?('AC_SOURCE_CACHE_') }
 
 source_cache_set = [
   '--set', 'sourceCache.endpoint=https://cache.example.test',
-  '--set', 'sourceCache.region=us-east-1',
+  '--set', 'sourceCache.region=auto',
   '--set', 'sourceCache.bucket=agentconnect-cache',
   '--set', 'sourceCache.prefix=install-a',
   '--set', 'sourceCache.forcePathStyle=true',
@@ -628,21 +632,23 @@ source_cache_set = [
 source_rendered, source_error, source_status = Open3.capture3(*(command + source_cache_set))
 abort("helm template (source cache enabled) failed:\n#{source_error}") unless source_status.success?
 source_documents = YAML.load_stream(source_rendered).compact
-source_deployment = source_documents.find do |doc|
-  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
-end || abort('missing daemon-pool Deployment in the source-cache render')
-source_container = source_deployment.dig('spec', 'template', 'spec', 'containers').find { |item| item['name'] == 'daemon-pool' } ||
-                   abort('missing daemon-pool container in the source-cache render')
-source_env = source_container.fetch('env')
-config_entry = source_env.find { |item| item['name'] == 'AC_SOURCE_CACHE_CONFIG' } ||
-               abort('daemon pool must receive the source-cache config')
-source_config = JSON.parse(config_entry.fetch('value'))
+source_config_map = source_documents.find do |doc|
+  doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == source_cache_name
+end || abort('daemon pool must receive the source-cache ConfigMap')
+source_config = JSON.parse(source_config_map.dig('data', 'config.json'))
+abort('source-cache config must carry version 1') unless source_config['version'] == 1
 abort('source-cache config must carry the endpoint') unless source_config['endpoint'] == 'https://cache.example.test'
-abort('source-cache config must carry the region') unless source_config['region'] == 'us-east-1'
+abort('source-cache config must carry the region') unless source_config['region'] == 'auto'
 abort('source-cache config must carry the bucket') unless source_config['bucket'] == 'agentconnect-cache'
 abort('source-cache config must carry the prefix') unless source_config['prefix'] == 'install-a'
 abort('source-cache config must carry forcePathStyle') unless source_config['forcePathStyle'] == true
-abort('source-cache config must name the credential source') unless source_config['credentialSource'] == 'secret'
+abort('source-cache config must name the credential source') unless source_config.dig('credentials', 'source') == 'secret'
+abort('source-cache Secret credentials must identify member-local key files') unless
+  source_config['credentials'] == {
+    'source' => 'secret',
+    'accessKeyIdFile' => '/var/run/ac-source-cache-credentials/access-key-id',
+    'secretAccessKeyFile' => '/var/run/ac-source-cache-credentials/secret-access-key'
+  }
 abort('source-cache config must carry section 10 limits') unless source_config['limits'] == {
   'maxBundleBytes' => 3000,
   'orgTotalBytes' => 30000,
@@ -652,28 +658,60 @@ abort('source-cache config must carry section 10 limits') unless source_config['
   'unreadPointerTtlDays' => 31
 }
 
-{
-  'AC_SOURCE_CACHE_ACCESS_KEY_ID' => 'AWS_ACCESS_KEY_ID',
-  'AC_SOURCE_CACHE_SECRET_ACCESS_KEY' => 'AWS_SECRET_ACCESS_KEY',
-  'AC_SOURCE_CACHE_SESSION_TOKEN' => 'AWS_SESSION_TOKEN'
-}.each do |env_name, secret_key|
-  entry = source_env.find { |item| item['name'] == env_name } || abort("daemon pool must project #{env_name}")
-  abort("#{env_name} must be a Secret reference, never an inline value") if entry.key?('value')
-  abort("#{env_name} must read #{secret_key} from sourceCache.existingSecret") unless
-    entry.dig('valueFrom', 'secretKeyRef') == {
-      'name' => 'source-cache-credentials',
-      'key' => secret_key
-    }
-end
+source_deployment = source_documents.find do |doc|
+  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
+end || abort('missing daemon-pool Deployment in the source-cache render')
+source_pod = source_deployment.dig('spec', 'template', 'spec')
+source_container = source_pod.fetch('containers').find { |item| item['name'] == 'daemon-pool' } ||
+                   abort('missing daemon-pool container in the source-cache render')
+abort('source-cache config must not travel through daemon environment') if
+  source_container.fetch('env').any? { |item| item.fetch('name').start_with?('AC_SOURCE_CACHE_') }
+source_mounts = source_container.fetch('volumeMounts').to_h { |item| [item.fetch('name'), item] }
+abort('daemon pool must mount the source-cache ConfigMap') unless
+  source_mounts.dig('source-cache', 'mountPath') == '/var/run/ac-source-cache'
+abort('daemon pool must mount the static credential Secret') unless
+  source_mounts.dig('source-cache-credentials', 'mountPath') == '/var/run/ac-source-cache-credentials'
+
+source_volumes = source_pod.fetch('volumes').to_h { |item| [item.fetch('name'), item] }
+abort('source-cache ConfigMap volume must name the rendered document') unless
+  source_volumes.dig('source-cache', 'configMap') == {
+    'defaultMode' => 256,
+    'items' => [{ 'key' => 'config.json', 'path' => 'config.json' }],
+    'name' => source_cache_name
+  }
+abort('source-cache Secret volume must be member-local') unless
+  source_volumes.dig('source-cache-credentials', 'secret', 'secretName') == 'source-cache-credentials'
+abort('two-key static credentials must not require a session-token key') unless
+  source_volumes.dig('source-cache-credentials', 'secret', 'items') == [
+    { 'key' => 'AWS_ACCESS_KEY_ID', 'path' => 'access-key-id' },
+    { 'key' => 'AWS_SECRET_ACCESS_KEY', 'path' => 'secret-access-key' }
+  ]
+
+source_config_bytes = source_config_map.dig('data', 'config.json')
+abort('source-cache ConfigMap must not inline static credentials') if
+  source_config_bytes.include?('AKIDEXAMPLE') || source_config_bytes.include?('secret-example')
 
 source_reconciler = source_documents.find do |doc|
   doc['kind'] == 'CronJob' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool-reconciler'
 end || abort('missing daemon-pool reconciler')
-abort('the reconciler must not receive source-cache credentials') if source_reconciler.to_yaml.include?('AC_SOURCE_CACHE')
+abort('the reconciler must not receive source-cache configuration') if source_reconciler.to_yaml.include?('source-cache')
 source_runtime = source_documents.find do |doc|
   doc['kind'] == 'SandboxTemplate' && doc.dig('metadata', 'name') == 'example-agentconnect-runtime'
 end || abort('missing runtime SandboxTemplate')
-abort('sandbox pods must never receive source-cache credentials') if source_runtime.to_yaml.include?('AC_SOURCE_CACHE')
+abort('sandbox pods must never receive source-cache configuration') if source_runtime.to_yaml.include?('source-cache')
+
+session_token_set = source_cache_set + ['--set', 'sourceCache.sessionTokenKey=AWS_SESSION_TOKEN']
+session_rendered, session_error, session_status = Open3.capture3(*(command + session_token_set))
+abort("helm template (source cache session token) failed:\n#{session_error}") unless session_status.success?
+session_documents = YAML.load_stream(session_rendered).compact
+session_deployment = session_documents.find do |doc|
+  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
+end || abort('missing daemon-pool Deployment in the session-token render')
+session_volumes = session_deployment.dig('spec', 'template', 'spec', 'volumes').to_h { |item| [item.fetch('name'), item] }
+abort('a configured session-token key must be projected as an optional-pair addition') unless
+  session_volumes.dig('source-cache-credentials', 'secret', 'items').include?(
+    { 'key' => 'AWS_SESSION_TOKEN', 'path' => 'session-token' }
+  )
 
 service_account_set = [
   '--set', 'sourceCache.endpoint=https://cache.example.test',
@@ -683,21 +721,33 @@ service_account_set = [
 service_rendered, service_error, service_status = Open3.capture3(*(command + service_account_set))
 abort("helm template (source cache service account) failed:\n#{service_error}") unless service_status.success?
 service_documents = YAML.load_stream(service_rendered).compact
-service_member = service_documents.find do |doc|
+service_config_map = service_documents.find do |doc|
+  doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == source_cache_name
+end || abort('missing service-account source-cache ConfigMap')
+service_config = JSON.parse(service_config_map.dig('data', 'config.json'))
+abort('ServiceAccount source must be AWS identity resolution') unless
+  service_config.dig('credentials', 'source') == 'serviceAccount'
+abort('ServiceAccount source must default to a concrete AWS region') unless service_config['region'] == 'us-east-1'
+service_deployment = service_documents.find do |doc|
   doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
-end.dig('spec', 'template', 'spec', 'containers').find { |item| item['name'] == 'daemon-pool' }
-service_env_names = service_member.fetch('env').map { |item| item.fetch('name') }
-abort('ServiceAccount source must not inject static-key environment') if service_env_names.any? { |name| name.start_with?('AC_SOURCE_CACHE_ACCESS_KEY', 'AC_SOURCE_CACHE_SECRET') }
+end || abort('missing daemon-pool service-account Deployment')
+service_pod = service_deployment.dig('spec', 'template', 'spec')
+service_container = service_pod.fetch('containers').find { |item| item['name'] == 'daemon-pool' }
+service_mount_names = service_container.fetch('volumeMounts').map { |item| item.fetch('name') }
+abort('ServiceAccount source must not mount the static credential Secret') if
+  service_mount_names.include?('source-cache-credentials')
+service_env_names = service_container.fetch('env').map { |item| item.fetch('name') }
+abort('ServiceAccount source must not inject static-key environment') if service_env_names.any? { |name| name.start_with?('AC_SOURCE_CACHE_') }
 
 [
   [['sourceCache.endpoint=https://cache.example.test', 'sourceCache.bucket=agentconnect-cache', 'sourceCache.credentialSource=secret'], 'existingSecret'],
-  [['sourceCache.endpoint=https://cache.example.test'], 'bucket']
+  [['sourceCache.endpoint=https://cache.example.test'], 'bucket'],
+  [['sourceCache.endpoint=https://cache.example.test', 'sourceCache.bucket=agentconnect-cache', 'sourceCache.credentialSource=serviceAccount', 'sourceCache.region=auto'], 'concrete AWS region']
 ].each do |settings, expected|
   extra = settings.flat_map { |setting| ['--set', setting] }
   _, refused, refused_status = Open3.capture3(*(command + extra))
   abort("incomplete source cache #{settings.join(', ')} must be refused") if refused_status.success?
   abort("refusal for #{settings.join(', ')} must say what is missing:\n#{refused}") unless refused.include?(expected)
 end
-
 
 puts 'chart render contract: ok'

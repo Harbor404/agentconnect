@@ -5,6 +5,8 @@
 {{- $sourceCache := .Values.sourceCache }}
 {{- $sourceCacheEndpoint := trim ($sourceCache.endpoint | default "") }}
 {{- $sourceCacheBucket := trim ($sourceCache.bucket | default "") }}
+{{- $sourceCacheRegion := trim ($sourceCache.region | default "us-east-1") }}
+{{- $sourceCacheCredentialSource := $sourceCache.credentialSource | default "serviceAccount" }}
 {{- $sourceCacheEnabled := and (ne $sourceCacheEndpoint "") (ne $sourceCacheBucket "") }}
 {{- if and (ne $sourceCacheEndpoint "") (eq $sourceCacheBucket "") }}
 {{- fail "sourceCache.bucket is required when sourceCache.endpoint is set" }}
@@ -13,24 +15,58 @@
 {{- fail "sourceCache.endpoint is required when sourceCache.bucket is set" }}
 {{- end }}
 {{- if $sourceCacheEnabled }}
-{{- if not (has $sourceCache.credentialSource (list "serviceAccount" "secret")) }}
+{{- if eq $sourceCacheRegion "" }}
+{{- fail "sourceCache.region is required when source cache is enabled" }}
+{{- end }}
+{{- if not (has $sourceCacheCredentialSource (list "serviceAccount" "secret")) }}
 {{- fail "sourceCache.credentialSource must be serviceAccount or secret" }}
 {{- end }}
-{{- if eq $sourceCache.credentialSource "secret" }}
+{{- if eq $sourceCacheCredentialSource "secret" }}
 {{- if not $sourceCache.existingSecret }}
 {{- fail "sourceCache.existingSecret is required when sourceCache.credentialSource=secret" }}
 {{- end }}
 {{- if or (not $sourceCache.accessKeyIdKey) (not $sourceCache.secretAccessKeyKey) }}
 {{- fail "sourceCache.accessKeyIdKey and sourceCache.secretAccessKeyKey are required for Secret credentials" }}
 {{- end }}
-{{- else if $sourceCache.existingSecret }}
+{{- else }}
+{{- if $sourceCache.existingSecret }}
 {{- fail "sourceCache.existingSecret is only valid when sourceCache.credentialSource=secret" }}
 {{- end }}
-{{- range $name := list "AC_SOURCE_CACHE_CONFIG" "AC_SOURCE_CACHE_ACCESS_KEY_ID" "AC_SOURCE_CACHE_SECRET_ACCESS_KEY" "AC_SOURCE_CACHE_SESSION_TOKEN" }}
-{{- if hasKey $.Values.daemonPool.extraEnv $name }}
-{{- fail (printf "daemonPool.extraEnv.%s collides with the chart-owned Source Cache configuration" $name) }}
+{{- if eq $sourceCacheRegion "auto" }}
+{{- fail "sourceCache.region must be a concrete AWS region when sourceCache.credentialSource=serviceAccount; use secret for stores such as R2" }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- if $sourceCacheEnabled }}
+{{- $sourceCacheCredentials := dict "source" $sourceCacheCredentialSource }}
+{{- if eq $sourceCacheCredentialSource "secret" }}
+{{- $_ := set $sourceCacheCredentials "accessKeyIdFile" "/var/run/ac-source-cache-credentials/access-key-id" }}
+{{- $_ := set $sourceCacheCredentials "secretAccessKeyFile" "/var/run/ac-source-cache-credentials/secret-access-key" }}
+{{- if $sourceCache.sessionTokenKey }}
+{{- $_ := set $sourceCacheCredentials "sessionTokenFile" "/var/run/ac-source-cache-credentials/session-token" }}
+{{- end }}
+{{- end }}
+{{- $sourceCacheDocument := dict
+  "version" 1
+  "endpoint" $sourceCacheEndpoint
+  "region" $sourceCacheRegion
+  "bucket" $sourceCacheBucket
+  "prefix" ($sourceCache.prefix | default "")
+  "forcePathStyle" ($sourceCache.forcePathStyle | default false)
+  "credentials" $sourceCacheCredentials
+  "limits" $sourceCache.limits }}
+# The member-only Source Cache document. It contains no static credential values; the optional
+# credential Secret below is mounted as files and is never projected into the process environment.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agentconnect.fullname" . }}-source-cache
+  labels:
+    {{- include "agentconnect.labels" . | nindent 4 }}
+    {{- include "agentconnect.componentLabels" (dict "ctx" . "component" "daemon-pool") | nindent 4 }}
+data:
+  config.json: {{ $sourceCacheDocument | toJson | quote }}
+---
 {{- end }}
 # The install-wide daemon pool. Its Pods are pool members.
 apiVersion: v1
@@ -195,31 +231,6 @@ spec:
             {{- include "agentconnect.daemonPoolClusterEnv" . | nindent 12 }}
             - name: AC_K8S_SHIM_PORT
               value: {{ .Values.daemonPool.shimPort | quote }}
-            {{- if $sourceCacheEnabled }}
-            # Member-only Source Cache configuration. Credential values are always projected
-            # by Secret reference; the static key path below never renders a value inline.
-            - name: AC_SOURCE_CACHE_CONFIG
-              value: {{ dict "endpoint" $sourceCacheEndpoint "region" $sourceCache.region "bucket" $sourceCacheBucket "prefix" $sourceCache.prefix "forcePathStyle" $sourceCache.forcePathStyle "credentialSource" $sourceCache.credentialSource "limits" $sourceCache.limits | toJson | quote }}
-            {{- if eq $sourceCache.credentialSource "secret" }}
-            - name: AC_SOURCE_CACHE_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $sourceCache.existingSecret | quote }}
-                  key: {{ $sourceCache.accessKeyIdKey | quote }}
-            - name: AC_SOURCE_CACHE_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $sourceCache.existingSecret | quote }}
-                  key: {{ $sourceCache.secretAccessKeyKey | quote }}
-            {{- if $sourceCache.sessionTokenKey }}
-            - name: AC_SOURCE_CACHE_SESSION_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $sourceCache.existingSecret | quote }}
-                  key: {{ $sourceCache.sessionTokenKey | quote }}
-            {{- end }}
-            {{- end }}
-            {{- end }}
             # The sink the readiness probe below reads: the daemon serves GET /readyz here and
             # answers 200 only once startup finished, the control plane acknowledged registration
             # and the install-wide runtime probe returned — 503 otherwise, including from SIGTERM
@@ -414,6 +425,16 @@ spec:
             - name: data-plane
               mountPath: /var/run/ac-data-plane
               readOnly: true
+            {{- if $sourceCacheEnabled }}
+            - name: source-cache
+              mountPath: /var/run/ac-source-cache
+              readOnly: true
+            {{- if eq $sourceCacheCredentialSource "secret" }}
+            - name: source-cache-credentials
+              mountPath: /var/run/ac-source-cache-credentials
+              readOnly: true
+            {{- end }}
+            {{- end }}
             - name: cp-identity
               mountPath: /var/run/ac-cp-identity
               readOnly: true
@@ -439,6 +460,30 @@ spec:
             items:
               - key: {{ .Values.daemonPool.dataPlane.key }}
                 path: config.json
+        {{- if $sourceCacheEnabled }}
+        - name: source-cache
+          configMap:
+            name: {{ include "agentconnect.fullname" . }}-source-cache
+            defaultMode: 0400
+            items:
+              - key: config.json
+                path: config.json
+        {{- if eq $sourceCacheCredentialSource "secret" }}
+        - name: source-cache-credentials
+          secret:
+            secretName: {{ $sourceCache.existingSecret | quote }}
+            defaultMode: 0400
+            items:
+              - key: {{ $sourceCache.accessKeyIdKey | quote }}
+                path: access-key-id
+              - key: {{ $sourceCache.secretAccessKeyKey | quote }}
+                path: secret-access-key
+              {{- if $sourceCache.sessionTokenKey }}
+              - key: {{ $sourceCache.sessionTokenKey | quote }}
+                path: session-token
+              {{- end }}
+        {{- end }}
+        {{- end }}
         - name: cp-identity
           projected:
             defaultMode: 0400

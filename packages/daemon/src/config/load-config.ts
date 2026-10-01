@@ -8,7 +8,6 @@ import {
 } from '@agentconnect.md/protocol'
 import { z } from 'zod'
 import { ConfigSchema, WorkspaceGitOrigin, type Config } from './config-schema.js'
-import { sourceCacheConfigFromEnv } from '../source-cache/config.js'
 import { resolveRoot, configPath, defaultAgentsDir } from '../paths.js'
 
 export interface FlatOverrides {
@@ -94,13 +93,6 @@ export function loadConfig(
     throw new Error(`config not found: ${file} (create it, pass --config, or run \`agentconnect login\`)`)
   }
   const cfg = ConfigSchema.parse(raw) // throws on invalid
-  // Pool members have no writable config file. The chart supplies the Source Cache
-  // document by environment; a file that states sourceCache wins (same precedence as
-  // the other operator-owned policy overrides below).
-  if ((raw as { sourceCache?: unknown } | null)?.sourceCache === undefined) {
-    const sourceCache = sourceCacheConfigFromEnv(process.env)
-    if (sourceCache) cfg.sourceCache = sourceCache
-  }
   for (const warning of mapLegacySandbox(cfg)) opts.warn?.(warning)
 
   const o = opts.overrides ?? {}

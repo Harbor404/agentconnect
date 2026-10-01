@@ -19,6 +19,7 @@ import { DEFAULT_SHIM_WORKSPACE_ROOT } from '../src/shim/protocol.js'
 import type { ResolvedRuntimeCatalog } from '../src/runtimes/registry.js'
 import { LocalStore } from '../src/store/local-store.js'
 import { DATA_PLANE_CONFIG_PATH } from '../src/store/postgres-config.js'
+import { SourceCacheConfigSchema, type readSourceCacheConfig } from '../src/source-cache/config.js'
 import { mcpSocketPath, statePath } from '../src/paths.js'
 import { SANDBOX_TUNNEL_PATHS } from '../src/shim/sandbox-paths.js'
 
@@ -100,6 +101,7 @@ function daemon(opts: {
   /** A store shared by several members, so a pool-wide probe can be asserted across them. */
   store?: LocalStore
   openDataPlane?: ReturnType<typeof vi.fn>
+  readSourceCacheConfig?: typeof readSourceCacheConfig
   startControlPlane?: ReturnType<typeof vi.fn>
   /** Receives the options the mode hands the plane — the rows about what it asks the pod to serve. */
   onPlaneStart?: (options: any) => void
@@ -133,6 +135,7 @@ function daemon(opts: {
         }
       : {}),
     ...(opts.openDataPlane ? { openDataPlane: opts.openDataPlane as never } : {}),
+    ...(opts.readSourceCacheConfig ? { readSourceCacheConfig: opts.readSourceCacheConfig as never } : {}),
     startControlPlane: (opts.startControlPlane ?? vi.fn(() => Promise.resolve())) as never,
     ...(opts.supervisor ? { supervisor: opts.supervisor } : {}),
     resolveCatalog: async () => catalog(),
@@ -278,6 +281,33 @@ describe('daemon --k8s mode', () => {
       expect(openDataPlane).not.toHaveBeenCalled()
     } finally {
       await local.stop()
+    }
+  })
+
+  it('loads the source-cache document only on a k8s pool member', async () => {
+    const sourceCache = SourceCacheConfigSchema.parse({
+      endpoint: 'https://cache.example.test',
+      region: 'us-east-1',
+      bucket: 'agentconnect-cache',
+      credentials: { source: 'serviceAccount' },
+      limits: {}
+    })
+    const readSourceCacheConfig = vi.fn(() => sourceCache)
+
+    const cfg = { store: { backend: 'local' }, limits: { poolShutdownDrainMs: 1 } } as never
+
+    const local = daemon({ root: root(), k8s: false, readSourceCacheConfig })
+    await (local as any).startClusterPlanes(root(), cfg)
+    expect(readSourceCacheConfig).not.toHaveBeenCalled()
+    expect((local as any).sourceCache).toBeUndefined()
+
+    const member = daemon({ root: root(), k8s: true, readSourceCacheConfig })
+    try {
+      await (member as any).startClusterPlanes(root(), cfg)
+      expect(readSourceCacheConfig).toHaveBeenCalledTimes(1)
+      expect((member as any).sourceCache).toBeDefined()
+    } finally {
+      await (member as any).dataPlane?.close()
     }
   })
 

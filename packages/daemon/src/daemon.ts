@@ -698,6 +698,8 @@ import { managedDistillCapture, withManagedDistill } from './memory/managed-dist
 import { defaultMemoryPluginMetrics } from './memory-plugin/metrics.js'
 import { openPostgresDataPlane, type PostgresDataPlane } from './store/postgres-data-plane.js'
 import { DATA_PLANE_CONFIG_PATH } from './store/postgres-config.js'
+import { readSourceCacheConfig } from './source-cache/config.js'
+import { createSourceCacheSigner, type SourceCacheSigner } from './source-cache/signer.js'
 import type { EvaluationCapabilityProfile } from './evaluation/events.js'
 import { DaemonEvaluationHooks, type DaemonEvaluationHost } from './evaluation/daemon-hooks.js'
 import { SessionMetadataOutbox, type SessionMetadataHost } from './store/session-metadata-outbox.js'
@@ -1583,6 +1585,8 @@ export class Daemon {
   private readonly clusterIdentityToken?: () => string | undefined
   // The k8s execution plane: shim dialer + driver + workspace seam. Undefined outside --k8s.
   private k8sPlane?: K8sRuntimePlane
+  // The pool-member Source Cache signer. Undefined is the off/no-op state; only --k8s composes it.
+  private sourceCache?: SourceCacheSigner
   // An undefined entry awaits retry; a promise is the one takeover already in flight.
   private readonly k8sAdoptions = new Map<string, Promise<void> | undefined>()
   private microsandbox?: MicrosandboxManager
@@ -1852,6 +1856,8 @@ export class Daemon {
       startK8sPlane?: typeof startK8sRuntimePlane
       /** Test seam only; production reads the fixed Secret mount under `--k8s`, else the `postgres` store's file. */
       openDataPlane?: typeof openPostgresDataPlane
+      /** Test seam only; production reads the fixed member-only Source Cache mount under `--k8s`. */
+      readSourceCacheConfig?: typeof readSourceCacheConfig
       /** Test seam for the pool member startup barrier; production waits for CP register/ok. */
       startControlPlane?: (root: string) => Promise<void> | undefined
       /** Test seams for local catalog resolution and executable/state filtering. */
@@ -2702,6 +2708,12 @@ export class Daemon {
 
   /** Phase 4 — the shared data plane (under --k8s, or a `postgres` store), then under --k8s the execution plane the workspaces resolve through. */
   private async startClusterPlanes(root: string, cfg: Config): Promise<void> {
+    // Source Cache is a pool-member capability. Composing it here keeps the shared Config loader and
+    // every non-k8s command unaware of both the document and any static credentials it resolves.
+    if (this.k8s) {
+      this.sourceCache = createSourceCacheSigner((this.opts.readSourceCacheConfig ?? readSourceCacheConfig)())
+      if (this.sourceCache) this.log.info('source cache: enabled')
+    }
     // `--k8s` needs the pool's shared store whatever the file says; any other daemon opens one only when its owner asked (#2188).
     const dataPlaneConfig = this.k8s
       ? DATA_PLANE_CONFIG_PATH

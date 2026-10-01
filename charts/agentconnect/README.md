@@ -67,6 +67,21 @@ helm install agentconnect oci://ghcr.io/agentconnect-md/charts/agentconnect \
   --set daemonPool.enabled=false --set installCRD=false --set relay.enabled=false
 ```
 
+## Source Cache
+
+Source Cache is optional and off by default. Set `sourceCache.endpoint` and
+`sourceCache.bucket` to enable it; only daemon-pool members receive the rendered
+document, and the reconciler and sandbox pods receive neither the document nor
+credentials.
+
+`sourceCache.credentialSource=serviceAccount` supports AWS identities only: the
+AWS access/secret environment pair, IRSA/web identity, or the ECS/EKS Pod Identity
+container endpoint. It also requires a concrete AWS region. Stores such as R2,
+MinIO, and GKE Workload Identity use `credentialSource=secret`; the referenced
+Secret is mounted as member-local files and is never placed in the process
+environment. `sourceCache.sessionTokenKey` is empty by default for the ordinary
+two-key access/secret pair and is set only when that Secret carries a session token.
+
 ## Requirements
 
 - **Kubernetes >= 1.28** (the relay reads the `apps.kubernetes.io/pod-index` label).

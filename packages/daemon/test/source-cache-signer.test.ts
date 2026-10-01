@@ -65,18 +65,21 @@ describe('source cache presigner', () => {
     expect(url.searchParams.get('X-Amz-Signature')).toMatch(/^[0-9a-f]{64}$/)
   })
 
-  it('allows a caller to shorten a lifetime but never past the SigV4 seven-day ceiling', async () => {
+  it('fixes GET and PUT at the design lifetimes and exposes no per-call override', async () => {
     const signer = createSourceCacheSigner(config(), { now: () => NOW })!
-    const short = new URL(await signer.presignGet('src/org/anon/repo/refs/hash/full/latest', { ttlSeconds: 60 }))
-    expect(short.searchParams.get('X-Amz-Expires')).toBe('60')
 
-    await expect(
-      signer.presignPut('src/org/anon/repo/bundles/x.bundle', {
+    const get = new URL(await signer.presignGet('src/org/anon/repo/refs/hash/full/latest'))
+    expect(get.searchParams.get('X-Amz-Expires')).toBe('300')
+
+    const put = new URL(
+      await signer.presignPut('src/org/anon/repo/bundles/x.bundle', {
         contentLength: 1,
-        checksumSha256: '47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=',
-        ttlSeconds: 7 * 24 * 60 * 60 + 1
+        checksumSha256: '47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='
       })
-    ).rejects.toThrow(/seven days|604800/i)
+    )
+    expect(put.searchParams.get('X-Amz-Expires')).toBe('900')
+    expect(SOURCE_CACHE_GET_TTL_SECONDS).toBe(300)
+    expect(SOURCE_CACHE_PUT_TTL_SECONDS).toBe(900)
   })
 
   it('uses the Kubernetes service account credential chain without embedding credentials in config', async () => {

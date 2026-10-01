@@ -10,25 +10,19 @@ import {
 
 export const SOURCE_CACHE_GET_TTL_SECONDS = 5 * 60
 export const SOURCE_CACHE_PUT_TTL_SECONDS = 15 * 60
-export const SOURCE_CACHE_MAX_PRESIGN_SECONDS = 7 * 24 * 60 * 60
-
 const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
 const ALGORITHM = 'AWS4-HMAC-SHA256'
 const SERVICE = 's3'
 const TERMINATOR = 'aws4_request'
 const PENDING_TAG = 'ac-cache=pending'
 
-export interface PresignOptions {
-  ttlSeconds?: number
-}
-
-export interface PresignPutInput extends PresignOptions {
+export interface PresignPutInput {
   contentLength: number
   checksumSha256: string
 }
 
 export interface SourceCacheSigner {
-  presignGet(key: string, options?: PresignOptions): Promise<string>
+  presignGet(key: string): Promise<string>
   presignPut(key: string, input: PresignPutInput): Promise<string>
 }
 
@@ -71,17 +65,6 @@ function formatAmzDate(date: Date): { timestamp: string; day: string } {
   if (!Number.isFinite(date.getTime())) throw new Error('source cache signer clock returned an invalid date')
   const timestamp = date.toISOString().replace(/[:-]|\.\d{3}/g, '')
   return { timestamp, day: timestamp.slice(0, 8) }
-}
-
-function ttlSeconds(value: number | undefined, fallback: number): number {
-  const ttl = value ?? fallback
-  if (!Number.isSafeInteger(ttl) || ttl <= 0) throw new Error('source cache presign TTL must be a positive integer')
-  if (ttl > SOURCE_CACHE_MAX_PRESIGN_SECONDS) {
-    throw new Error(
-      `source cache presign TTL cannot exceed the SigV4 seven-day ceiling (${SOURCE_CACHE_MAX_PRESIGN_SECONDS}s)`
-    )
-  }
-  return ttl
 }
 
 function objectKey(prefix: string, key: string): string {
@@ -129,8 +112,8 @@ class AwsSigV4SourceCacheSigner implements SourceCacheSigner {
     this.endpoint = new URL(config.endpoint)
   }
 
-  async presignGet(key: string, options: PresignOptions = {}): Promise<string> {
-    return this.presign('GET', key, {}, ttlSeconds(options.ttlSeconds, SOURCE_CACHE_GET_TTL_SECONDS))
+  async presignGet(key: string): Promise<string> {
+    return this.presign('GET', key, {}, SOURCE_CACHE_GET_TTL_SECONDS)
   }
 
   async presignPut(key: string, input: PresignPutInput): Promise<string> {
@@ -142,7 +125,7 @@ class AwsSigV4SourceCacheSigner implements SourceCacheSigner {
         'x-amz-checksum-sha256': checksumSha256(input.checksumSha256),
         'x-amz-tagging': PENDING_TAG
       },
-      ttlSeconds(input.ttlSeconds, SOURCE_CACHE_PUT_TTL_SECONDS)
+      SOURCE_CACHE_PUT_TTL_SECONDS
     )
   }
 

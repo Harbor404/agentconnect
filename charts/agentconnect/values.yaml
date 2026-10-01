@@ -410,27 +410,32 @@ daemonPool:
     tolerations: []
 
 # Optional Source Cache. Empty endpoint or bucket leaves it OFF: no URLs are issued and
-# pool members clone from origin exactly as before. Only the daemon-pool member receives
-# this configuration; sandbox pods never receive bucket credentials.
+# pool members clone from origin exactly as before. Only the daemon-pool member receives the
+# mounted document; sandbox pods and the reconciler receive neither the document nor credentials.
 sourceCache:
   # Full S3 API origin, e.g. https://s3.us-east-1.amazonaws.com or https://minio.example.test
   endpoint: ''
-  # SigV4 region. Use "auto" for R2; a concrete region for S3 or MinIO.
-  region: auto
+  # SigV4 region. serviceAccount requires a concrete AWS region. Use "auto" only with secret
+  # credentials for a non-AWS S3-compatible store such as R2.
+  region: us-east-1
   # Bucket (or bucket prefix) dedicated to this install's Source Cache.
   bucket: ''
   # Optional key prefix inside the bucket. The daemon adds src/, files/, and snapshots/ below it.
   prefix: ''
   # MinIO and other S3-compatible stores commonly require path-style addressing.
   forcePathStyle: false
-  # serviceAccount uses the pool member's IAM/Workload Identity. secret projects static keys
-  # from an existing Secret by name; it never embeds credential values in this values file.
+  # serviceAccount resolves AWS identities only: the AWS access/secret environment pair,
+  # IRSA/web identity, or the ECS/EKS Pod Identity container endpoint. GKE Workload Identity,
+  # R2, MinIO, and other non-AWS stores require secret credentials.
+  # secret mounts an existing Kubernetes Secret as member-local files; credential values are
+  # never rendered into this values file, the Source Cache document, or process environment.
   credentialSource: serviceAccount
   existingSecret: ''
   accessKeyIdKey: AWS_ACCESS_KEY_ID
   secretAccessKeyKey: AWS_SECRET_ACCESS_KEY
-  # Optional; set to "" for stores or identities that do not issue a session token.
-  sessionTokenKey: AWS_SESSION_TOKEN
+  # Optional session-token file. Empty is the normal two-key access/secret setup; set it only
+  # when the referenced Secret actually carries a session token.
+  sessionTokenKey: ''
   # Section 10 limits. The daemon validates the values; the data plane enforces them.
   limits:
     maxBundleBytes: 2147483648 # 2 GiB
