@@ -409,6 +409,37 @@ daemonPool:
     nodeSelector: {}
     tolerations: []
 
+# Optional Source Cache. Empty endpoint or bucket leaves it OFF: no URLs are issued and
+# pool members clone from origin exactly as before. Only the daemon-pool member receives
+# this configuration; sandbox pods never receive bucket credentials.
+sourceCache:
+  # Full S3 API origin, e.g. https://s3.us-east-1.amazonaws.com or https://minio.example.test
+  endpoint: ''
+  # SigV4 region. Use "auto" for R2; a concrete region for S3 or MinIO.
+  region: auto
+  # Bucket (or bucket prefix) dedicated to this install's Source Cache.
+  bucket: ''
+  # Optional key prefix inside the bucket. The daemon adds src/, files/, and snapshots/ below it.
+  prefix: ''
+  # MinIO and other S3-compatible stores commonly require path-style addressing.
+  forcePathStyle: false
+  # serviceAccount uses the pool member's IAM/Workload Identity. secret projects static keys
+  # from an existing Secret by name; it never embeds credential values in this values file.
+  credentialSource: serviceAccount
+  existingSecret: ''
+  accessKeyIdKey: AWS_ACCESS_KEY_ID
+  secretAccessKeyKey: AWS_SECRET_ACCESS_KEY
+  # Optional; set to "" for stores or identities that do not issue a session token.
+  sessionTokenKey: AWS_SESSION_TOKEN
+  # Section 10 limits. The daemon validates the values; the data plane enforces them.
+  limits:
+    maxBundleBytes: 2147483648 # 2 GiB
+    orgTotalBytes: 21474836480 # 20 GiB
+    pendingReservationMs: 3600000 # 1 h
+    pendingObjectTtlDays: 2
+    unreferencedObjectTtlDays: 7
+    unreadPointerTtlDays: 30
+
 controlPlane:
   image: control-plane
   # Per-component tag override; empty ⇒ the shared image.tag. Set it to the

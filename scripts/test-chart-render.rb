@@ -610,4 +610,94 @@ default_member = find.call('Deployment', 'example-agentconnect-daemon-pool')
                      .dig('spec', 'template', 'spec', 'containers', 0).fetch('env').map { |item| item.fetch('name') }
 abort('an unset grace must leave both sides on the daemon default') if default_member.include?('AC_K8S_ORPHAN_GRACE_MS')
 
+# Source Cache is a daemon-pool member capability only. The default has no bucket configured, so
+# it must render no source-cache environment at all; enabling Secret credentials must project
+# values by reference, never inline, and must stay out of reconciler/sandbox objects.
+abort('source Cache must be off by default') if container.fetch('env').any? { |item| item.fetch('name').start_with?('AC_SOURCE_CACHE_') }
+
+source_cache_set = [
+  '--set', 'sourceCache.endpoint=https://cache.example.test',
+  '--set', 'sourceCache.region=us-east-1',
+  '--set', 'sourceCache.bucket=agentconnect-cache',
+  '--set', 'sourceCache.prefix=install-a',
+  '--set', 'sourceCache.forcePathStyle=true',
+  '--set', 'sourceCache.credentialSource=secret',
+  '--set', 'sourceCache.existingSecret=source-cache-credentials',
+  '--set-json', 'sourceCache.limits={"maxBundleBytes":3000,"orgTotalBytes":30000,"pendingReservationMs":7200000,"pendingObjectTtlDays":3,"unreferencedObjectTtlDays":8,"unreadPointerTtlDays":31}'
+]
+source_rendered, source_error, source_status = Open3.capture3(*(command + source_cache_set))
+abort("helm template (source cache enabled) failed:\n#{source_error}") unless source_status.success?
+source_documents = YAML.load_stream(source_rendered).compact
+source_deployment = source_documents.find do |doc|
+  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
+end || abort('missing daemon-pool Deployment in the source-cache render')
+source_container = source_deployment.dig('spec', 'template', 'spec', 'containers').find { |item| item['name'] == 'daemon-pool' } ||
+                   abort('missing daemon-pool container in the source-cache render')
+source_env = source_container.fetch('env')
+config_entry = source_env.find { |item| item['name'] == 'AC_SOURCE_CACHE_CONFIG' } ||
+               abort('daemon pool must receive the source-cache config')
+source_config = JSON.parse(config_entry.fetch('value'))
+abort('source-cache config must carry the endpoint') unless source_config['endpoint'] == 'https://cache.example.test'
+abort('source-cache config must carry the region') unless source_config['region'] == 'us-east-1'
+abort('source-cache config must carry the bucket') unless source_config['bucket'] == 'agentconnect-cache'
+abort('source-cache config must carry the prefix') unless source_config['prefix'] == 'install-a'
+abort('source-cache config must carry forcePathStyle') unless source_config['forcePathStyle'] == true
+abort('source-cache config must name the credential source') unless source_config['credentialSource'] == 'secret'
+abort('source-cache config must carry section 10 limits') unless source_config['limits'] == {
+  'maxBundleBytes' => 3000,
+  'orgTotalBytes' => 30000,
+  'pendingReservationMs' => 7_200_000,
+  'pendingObjectTtlDays' => 3,
+  'unreferencedObjectTtlDays' => 8,
+  'unreadPointerTtlDays' => 31
+}
+
+{
+  'AC_SOURCE_CACHE_ACCESS_KEY_ID' => 'AWS_ACCESS_KEY_ID',
+  'AC_SOURCE_CACHE_SECRET_ACCESS_KEY' => 'AWS_SECRET_ACCESS_KEY',
+  'AC_SOURCE_CACHE_SESSION_TOKEN' => 'AWS_SESSION_TOKEN'
+}.each do |env_name, secret_key|
+  entry = source_env.find { |item| item['name'] == env_name } || abort("daemon pool must project #{env_name}")
+  abort("#{env_name} must be a Secret reference, never an inline value") if entry.key?('value')
+  abort("#{env_name} must read #{secret_key} from sourceCache.existingSecret") unless
+    entry.dig('valueFrom', 'secretKeyRef') == {
+      'name' => 'source-cache-credentials',
+      'key' => secret_key
+    }
+end
+
+source_reconciler = source_documents.find do |doc|
+  doc['kind'] == 'CronJob' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool-reconciler'
+end || abort('missing daemon-pool reconciler')
+abort('the reconciler must not receive source-cache credentials') if source_reconciler.to_yaml.include?('AC_SOURCE_CACHE')
+source_runtime = source_documents.find do |doc|
+  doc['kind'] == 'SandboxTemplate' && doc.dig('metadata', 'name') == 'example-agentconnect-runtime'
+end || abort('missing runtime SandboxTemplate')
+abort('sandbox pods must never receive source-cache credentials') if source_runtime.to_yaml.include?('AC_SOURCE_CACHE')
+
+service_account_set = [
+  '--set', 'sourceCache.endpoint=https://cache.example.test',
+  '--set', 'sourceCache.bucket=agentconnect-cache',
+  '--set', 'sourceCache.credentialSource=serviceAccount'
+]
+service_rendered, service_error, service_status = Open3.capture3(*(command + service_account_set))
+abort("helm template (source cache service account) failed:\n#{service_error}") unless service_status.success?
+service_documents = YAML.load_stream(service_rendered).compact
+service_member = service_documents.find do |doc|
+  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
+end.dig('spec', 'template', 'spec', 'containers').find { |item| item['name'] == 'daemon-pool' }
+service_env_names = service_member.fetch('env').map { |item| item.fetch('name') }
+abort('ServiceAccount source must not inject static-key environment') if service_env_names.any? { |name| name.start_with?('AC_SOURCE_CACHE_ACCESS_KEY', 'AC_SOURCE_CACHE_SECRET') }
+
+[
+  [['sourceCache.endpoint=https://cache.example.test', 'sourceCache.bucket=agentconnect-cache', 'sourceCache.credentialSource=secret'], 'existingSecret'],
+  [['sourceCache.endpoint=https://cache.example.test'], 'bucket']
+].each do |settings, expected|
+  extra = settings.flat_map { |setting| ['--set', setting] }
+  _, refused, refused_status = Open3.capture3(*(command + extra))
+  abort("incomplete source cache #{settings.join(', ')} must be refused") if refused_status.success?
+  abort("refusal for #{settings.join(', ')} must say what is missing:\n#{refused}") unless refused.include?(expected)
+end
+
+
 puts 'chart render contract: ok'

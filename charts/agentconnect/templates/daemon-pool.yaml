@@ -2,6 +2,36 @@
 {{- $dataPlaneSecret := required "daemonPool.dataPlane.existingSecret is required when daemonPool.enabled" .Values.daemonPool.dataPlane.existingSecret }}
 {{- $sandboxNamespace := .Values.daemonPool.sandboxNamespace | default .Release.Namespace }}
 {{- $daemonTag := .Values.daemonPool.tag | default (include "agentconnect.imageTag" .) }}
+{{- $sourceCache := .Values.sourceCache }}
+{{- $sourceCacheEndpoint := trim ($sourceCache.endpoint | default "") }}
+{{- $sourceCacheBucket := trim ($sourceCache.bucket | default "") }}
+{{- $sourceCacheEnabled := and (ne $sourceCacheEndpoint "") (ne $sourceCacheBucket "") }}
+{{- if and (ne $sourceCacheEndpoint "") (eq $sourceCacheBucket "") }}
+{{- fail "sourceCache.bucket is required when sourceCache.endpoint is set" }}
+{{- end }}
+{{- if and (eq $sourceCacheEndpoint "") (ne $sourceCacheBucket "") }}
+{{- fail "sourceCache.endpoint is required when sourceCache.bucket is set" }}
+{{- end }}
+{{- if $sourceCacheEnabled }}
+{{- if not (has $sourceCache.credentialSource (list "serviceAccount" "secret")) }}
+{{- fail "sourceCache.credentialSource must be serviceAccount or secret" }}
+{{- end }}
+{{- if eq $sourceCache.credentialSource "secret" }}
+{{- if not $sourceCache.existingSecret }}
+{{- fail "sourceCache.existingSecret is required when sourceCache.credentialSource=secret" }}
+{{- end }}
+{{- if or (not $sourceCache.accessKeyIdKey) (not $sourceCache.secretAccessKeyKey) }}
+{{- fail "sourceCache.accessKeyIdKey and sourceCache.secretAccessKeyKey are required for Secret credentials" }}
+{{- end }}
+{{- else if $sourceCache.existingSecret }}
+{{- fail "sourceCache.existingSecret is only valid when sourceCache.credentialSource=secret" }}
+{{- end }}
+{{- range $name := list "AC_SOURCE_CACHE_CONFIG" "AC_SOURCE_CACHE_ACCESS_KEY_ID" "AC_SOURCE_CACHE_SECRET_ACCESS_KEY" "AC_SOURCE_CACHE_SESSION_TOKEN" }}
+{{- if hasKey $.Values.daemonPool.extraEnv $name }}
+{{- fail (printf "daemonPool.extraEnv.%s collides with the chart-owned Source Cache configuration" $name) }}
+{{- end }}
+{{- end }}
+{{- end }}
 # The install-wide daemon pool. Its Pods are pool members.
 apiVersion: v1
 kind: ServiceAccount
@@ -165,6 +195,31 @@ spec:
             {{- include "agentconnect.daemonPoolClusterEnv" . | nindent 12 }}
             - name: AC_K8S_SHIM_PORT
               value: {{ .Values.daemonPool.shimPort | quote }}
+            {{- if $sourceCacheEnabled }}
+            # Member-only Source Cache configuration. Credential values are always projected
+            # by Secret reference; the static key path below never renders a value inline.
+            - name: AC_SOURCE_CACHE_CONFIG
+              value: {{ dict "endpoint" $sourceCacheEndpoint "region" $sourceCache.region "bucket" $sourceCacheBucket "prefix" $sourceCache.prefix "forcePathStyle" $sourceCache.forcePathStyle "credentialSource" $sourceCache.credentialSource "limits" $sourceCache.limits | toJson | quote }}
+            {{- if eq $sourceCache.credentialSource "secret" }}
+            - name: AC_SOURCE_CACHE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sourceCache.existingSecret | quote }}
+                  key: {{ $sourceCache.accessKeyIdKey | quote }}
+            - name: AC_SOURCE_CACHE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sourceCache.existingSecret | quote }}
+                  key: {{ $sourceCache.secretAccessKeyKey | quote }}
+            {{- if $sourceCache.sessionTokenKey }}
+            - name: AC_SOURCE_CACHE_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $sourceCache.existingSecret | quote }}
+                  key: {{ $sourceCache.sessionTokenKey | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             # The sink the readiness probe below reads: the daemon serves GET /readyz here and
             # answers 200 only once startup finished, the control plane acknowledged registration
             # and the install-wide runtime probe returned — 503 otherwise, including from SIGTERM
