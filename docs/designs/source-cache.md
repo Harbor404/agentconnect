@@ -103,7 +103,16 @@ it, `git fsck` passes on the result, and a checkout fetches only the blobs it
 needs. With `GIT_NO_LAZY_FETCH=1` a filtered bundle is written from a partial
 clone without fetching anything (verified on Git 2.54).
 The daemon image is `node:24-bookworm-slim` (Git 2.39). The runtime sandbox image
-is built separately and its Git version must be confirmed (section 14).
+is built separately. Its pinned dependency base was run on 2026-10-01 and ships
+Git 2.39.5; the image verifier now behaviorally pins `--bundle-uri`,
+`git bundle create --filter=blob:none` and `GIT_NO_LAZY_FETCH`, so a later base
+bump fails the image build if any of them regresses (section 14).
+
+The P0 S3-compatible store matrix was also sampled on 2026-10-01. The archived
+MinIO release `RELEASE.2025-10-15T17-29-55Z` passed conditional `If-Match`,
+presigned PUT with signed `Content-Length`, `x-amz-checksum-sha256` and
+`x-amz-tagging`, and a tag-filtered lifecycle rule. AWS S3 remains unverified
+until credentials are available; section 14 records the exact results and gate.
 
 ## 4. Storage layout
 
@@ -535,12 +544,66 @@ Each phase ships and rolls back alone.
   admission and preview, arbitrary-host public Sources, skipped-Source status in
   the console.
 
-Before P1: confirm the runtime image's Git version (≥ 2.38 for `--bundle-uri`;
-filtered bundles and `GIT_NO_LAZY_FETCH` need a recent Git and should be pinned
-by the image test), and which S3-compatible stores the chart supports for
-conditional writes, signed `Content-Length`, `x-amz-checksum-sha256` and
-`x-amz-tagging` on presigned PUTs, and tag-filtered lifecycle rules (AWS S3 and
-MinIO at least).
+### P0 prerequisites and baseline (2026-10-01)
+
+**Runtime image Git.** The runtime sandbox dependency base pinned by that day's
+Dockerfile (`RUNTIME_SANDBOX_BASE`) ran Git 2.39.5. The pinned digest was
+`sha256:bc7614a2d7de40b77e03ac8cfdd09b738efbf93391122cb54ca4d1233c68f5cb`.
+In that exact image:
+
+- a blobless `--filter=blob:none` bundle was created and `git bundle verify`
+  reported filter `blob:none`;
+- `GIT_NO_LAZY_FETCH=1` stopped a missing promisor object without invoking the
+  configured lazy-fetch helper and reported `lazy fetching disabled`;
+- a blobless clone consumed a bundle through `--bundle-uri`.
+
+`docker/runtime-sandbox/verify-image.mjs` now fails either runtime image build
+below Git 2.38 or when any of those three behaviors regresses.
+
+**S3-compatible store matrix.** MinIO
+`RELEASE.2025-10-15T17-29-55Z` was tested locally on 2026-10-01:
+
+| Primitive                                         | MinIO result | Evidence                                                                                                                       |
+| ------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| Conditional `PutObject` with `If-Match`           | Pass         | A wrong ETag was rejected; the matching ETag replaced the pointer.                                                             |
+| Presigned PUT with signed `Content-Length`        | Pass         | `X-Amz-SignedHeaders` included `content-length`; the exact request stored the declared length.                                 |
+| Presigned PUT with signed `x-amz-checksum-sha256` | Pass         | The correct checksum stored; a body/checksum mismatch returned `XAmzContentChecksumMismatch`.                                  |
+| Presigned PUT with signed `x-amz-tagging`         | Pass         | The stored tag was `ac-cache=pending`; omitting a signed header was refused as an unsigned-header request.                     |
+| Tag-filtered lifecycle expiration                 | Pass         | Lifecycle readback contained `Filter.Tag { ac-cache = pending }`, `Expiration.Days = 2`; the tagged object reported that rule. |
+
+AWS S3 was **not verified**: this workstation had no AWS credentials. Its
+conditional-write and signing capabilities therefore remain unassumed for P1.
+The fallbacks are: use last-writer-wins pointer replacement when `If-Match` is
+absent (section 9); do not enable write-back when the store cannot enforce the
+declared length/checksum/tag on a presigned PUT; and keep write-back disabled
+where the lifecycle cannot select `ac-cache=pending`, because the database sweep
+alone loses the no-row orphan guarantee.
+
+**Bundle behavior.** The pinned runtime base container, not a test-app pod, was
+used for a local Git 2.39.5 spike:
+
+- a bundle URL with an HTTPS query string was fetched successfully;
+- the blobless `cloneSessionRootAt` shape used `--filter=blob:none`,
+  `--no-checkout`, `--single-branch` and a `--bundle-uri=<url>`; `reset --hard`
+  fetched the missing blob;
+- a foreign `refs/heads/main` bundle left `refs/bundles/main` at the foreign
+  commit while the clone's branch and `origin/main` stayed at the origin commit;
+- a `tree:0` bundle used by a full clone exited 128 with
+  `unable to parse commit` and `Clone succeeded, but checkout failed`; it left
+  `refs/bundles/main` for the retry path to remove.
+
+This reproduces the §6/§7 behavior at the container layer, but it does not
+replace the required test-app pod run.
+
+**Baseline timings.** Not measured. This workstation had no test-app kubeconfig,
+so the cold workspace clone, skill install and claim → runtime-ready numbers are
+still missing and must not be inferred from local runs.
+
+**Go/no-go.** Go for P1 implementation against the pinned runtime base and
+MinIO, with the regressions above pinned. No-go for claiming AWS S3 support,
+enabling Source Cache by default, or treating CP0.3 as complete until the AWS
+matrix and test-app pod/timing checks run. The chart default remains off while
+`sourceCache` is unimplemented.
 
 ## 15. Change index
 

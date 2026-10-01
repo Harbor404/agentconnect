@@ -57,6 +57,41 @@ const DSH_PRESET_DIR = '/opt/agentconnect/dsh/agent-presets/standard-no-search'
 // Must match SANDBOX_BROWSER_EXECUTABLE_ENV in sandbox-paths.ts: the shim forwards this path into the runtime's env.
 const BROWSER_ENV = 'AGENT_BROWSER_EXECUTABLE_PATH'
 
+// Source Cache P0: `git bundle --filter=blob:none`, `GIT_NO_LAZY_FETCH` and
+// `--bundle-uri` are all behavioral capabilities, not just flags in `-h`. Keep the
+// probe small enough for every image build and run it as the final non-root user.
+const SOURCE_CACHE_GIT_PROBE = String.raw`
+set -eu
+tmp=$(mktemp -d)
+mkdir "$tmp/source"
+git init -q -b main "$tmp/source"
+git -C "$tmp/source" config user.name agentconnect-image-check
+git -C "$tmp/source" config user.email image-check@example.invalid
+git -C "$tmp/source" config uploadpack.allowfilter true
+printf 'content\n' >"$tmp/source/file"
+git -C "$tmp/source" add file
+git -C "$tmp/source" commit -qm source
+GIT_NO_LAZY_FETCH=1 git -C "$tmp/source" bundle create "$tmp/blobless.bundle" --filter=blob:none refs/heads/main
+git -C "$tmp/source" bundle verify "$tmp/blobless.bundle" | grep -F 'The bundle uses this filter: blob:none'
+git clone -q --filter=blob:none --no-checkout --bundle-uri="file://$tmp/blobless.bundle" "file://$tmp/source" "$tmp/bundled"
+test "$(git -C "$tmp/bundled" rev-parse refs/bundles/main)" = "$(git -C "$tmp/source" rev-parse refs/heads/main)"
+git -C "$tmp/bundled" rev-parse --verify HEAD >/dev/null
+git clone -q --filter=blob:none --no-checkout "file://$tmp/source" "$tmp/partial"
+cat >"$tmp/fake-upload-pack" <<'EOF'
+#!/bin/sh
+touch "$TMP_MARKER"
+exit 1
+EOF
+chmod +x "$tmp/fake-upload-pack"
+git -C "$tmp/partial" config remote.origin.uploadpack "$tmp/fake-upload-pack"
+if TMP_MARKER="$tmp/marker" GIT_NO_LAZY_FETCH=1 git -C "$tmp/partial" cat-file -p HEAD:file >"$tmp/out" 2>"$tmp/err"; then
+  echo 'GIT_NO_LAZY_FETCH=1 did not block lazy fetch' >&2
+  exit 1
+fi
+grep -F 'lazy fetching disabled' "$tmp/err" >/dev/null
+test ! -e "$tmp/marker"
+`
+
 // First, while nothing in this stage has run yet: a build step that ran as root inside the workspace leaves state
 // the runtime cannot write, and the symptom is a runtime that will not start for the user that owns its own home.
 check('the workspace contains nothing the runtime user cannot write', () => {
@@ -79,6 +114,19 @@ check('runs as a non-root user', () => {
   const uid = sh('id -u')
   if (uid === '0') throw new Error('image runs as root')
   return `uid ${uid}`
+})
+
+check('Git supports the Source Cache bundle primitives', () => {
+  const version = sh('git --version')
+  const match = /^git version (\d+)\.(\d+)(?:\.\d+)?/.exec(version)
+  if (!match) throw new Error(`unexpected git --version output: ${version}`)
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  if (major < 2 || (major === 2 && minor < 38)) {
+    throw new Error(`Git ${match[1]}.${match[2]} is older than 2.38 (${version})`)
+  }
+  sh(SOURCE_CACHE_GIT_PROBE)
+  return `${version}; blob:none bundle, GIT_NO_LAZY_FETCH and --bundle-uri work`
 })
 
 if (variant === 'runtime-sandbox-full') {
