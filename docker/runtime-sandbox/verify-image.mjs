@@ -74,6 +74,7 @@ git -C "$tmp/source" commit -qm source
 GIT_NO_LAZY_FETCH=1 git -C "$tmp/source" bundle create "$tmp/blobless.bundle" --filter=blob:none refs/heads/main
 git -C "$tmp/source" bundle verify "$tmp/blobless.bundle" | grep -F 'The bundle uses this filter: blob:none'
 git clone -q --filter=blob:none --no-checkout --bundle-uri="file://$tmp/blobless.bundle" "file://$tmp/source" "$tmp/bundled"
+test "$(git -C "$tmp/bundled" rev-parse refs/bundles/main)" = "$(git -C "$tmp/source" rev-parse refs/heads/main)"
 git -C "$tmp/bundled" rev-parse --verify HEAD >/dev/null
 git clone -q --filter=blob:none --no-checkout "file://$tmp/source" "$tmp/partial"
 cat >"$tmp/fake-upload-pack" <<'EOF'
