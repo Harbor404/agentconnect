@@ -259,6 +259,13 @@ describe('null-safe parameter comparison', () => {
 
 // message-intake.md §10: the admission backfill has the same trap — and every camelCase
 // identifier it reads back has to be in `canonicalColumns`, which nothing else checks.
+describe('source cache accounting columns', () => {
+  it('restores every camelCase source-cache column name', () => {
+    for (const column of ['repositoryUrlHash', 'refHash', 'lastReadAt', 'referenced', 'usedBytes'])
+      expect(canonicalColumns).toContain(column)
+  })
+})
+
 describe('transcript admission backfill', () => {
   it('rewrites to a conflict clause rather than reaching PostgreSQL as SQLite syntax', () => {
     const out = rewrite(TRANSCRIPT_ADMISSION_BACKFILL)

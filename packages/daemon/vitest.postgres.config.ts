@@ -20,6 +20,7 @@ export default defineConfig({
       'test/session-executor-store.test.ts',
       'test/memory-entries.test.ts',
       'test/store-concurrency.test.ts',
+      'test/source-cache-accounting.test.ts',
       'test/memory-capture-outbox.test.ts',
       'test/store-retention.test.ts',
       'test/decision-verdict-store.test.ts',

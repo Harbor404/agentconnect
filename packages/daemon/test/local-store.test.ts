@@ -3820,7 +3820,7 @@ describe.skipIf(pg)('decision table migrations', () => {
   }
 
   it('creates the decision tables on a fresh store and stamps the current version', async () => {
-    expect(SCHEMA_VERSION).toBe(34)
+    expect(SCHEMA_VERSION).toBe(35)
     const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v26-')), 'local.sqlite')
     await (await LocalStore.open(path)).close()
     expect(tables(path)).toEqual([
@@ -3829,6 +3829,33 @@ describe.skipIf(pg)('decision table migrations', () => {
       'decision_release',
       'decision_verdict'
     ])
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('adds Source Cache accounting tables to a v34 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v34-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE source_cache_object; DROP TABLE source_cache_usage; PRAGMA user_version = 34')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    expect(
+      await upgraded.reserveSourceCacheObject(
+        {
+          orgId: 'org',
+          key: 'bundles/a.bundle',
+          kind: 'bundle',
+          bytes: 1,
+          repositoryUrlHash: 'repo',
+          refHash: 'ref',
+          createdAt: 1,
+          expiresAt: 2
+        },
+        1
+      )
+    ).toMatchObject({ orgId: 'org', key: 'bundles/a.bundle', state: 'pending' })
+    await upgraded.close()
     expect(userVersion(path)).toBe(SCHEMA_VERSION)
   })
 

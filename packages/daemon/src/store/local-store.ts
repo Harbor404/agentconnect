@@ -163,6 +163,40 @@ export type OrgForAgent = (agentId: string) => string | undefined
 export type LocalStoreSource =
   string | { database: StoreDatabase; shared?: boolean; ownerId?: string; orgForAgent?: OrgForAgent }
 
+export type SourceCacheObjectKind = 'bundle' | 'pointer'
+export type SourceCacheObjectState = 'pending' | 'committed'
+
+export interface SourceCacheObjectRow {
+  orgId: string
+  key: string
+  kind: SourceCacheObjectKind
+  state: SourceCacheObjectState
+  bytes: number
+  repositoryUrlHash: string
+  refHash: string
+  createdAt: number
+  expiresAt: number | null
+  lastReadAt: number | null
+  referenced: number
+}
+
+export interface SourceCacheReservationInput {
+  orgId: string
+  key: string
+  kind: SourceCacheObjectKind
+  bytes: number
+  repositoryUrlHash: string
+  refHash: string
+  createdAt: number
+  expiresAt: number
+}
+
+export interface SourceCacheUsageRow {
+  orgId: string
+  usedBytes: number
+  updatedAt: number
+}
+
 /** Transcript org partition of a store no pool shares: it holds exactly one daemon's
  *  threads, so it owns one partition forever, the way `cacheOwnerId` owns one. */
 const LOCAL_TRANSCRIPT_ORG = ''
@@ -1156,6 +1190,37 @@ const APPEND_RESERVATION_SCHEMA = `
       );
 `
 
+// Source Cache accounting (source-cache.md §§9–10). The usage row is the per-org
+// serialization point for reservations, commits and expiry; the object rows are the
+// durable reservation/accounting ledger.
+const SOURCE_CACHE_SCHEMA = `
+      CREATE TABLE IF NOT EXISTS source_cache_object (
+        orgId TEXT NOT NULL,
+        key TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('bundle', 'pointer')),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'committed')),
+        bytes INTEGER NOT NULL CHECK (bytes >= 0),
+        repositoryUrlHash TEXT NOT NULL,
+        refHash TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        expiresAt INTEGER,
+        lastReadAt INTEGER,
+        referenced INTEGER NOT NULL DEFAULT 0 CHECK (referenced IN (0, 1)),
+        PRIMARY KEY (orgId, key),
+        CHECK (
+          (state = 'pending' AND expiresAt IS NOT NULL) OR
+          (state = 'committed' AND expiresAt IS NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS source_cache_object_expiry
+        ON source_cache_object (orgId, state, expiresAt);
+      CREATE TABLE IF NOT EXISTS source_cache_usage (
+        orgId TEXT PRIMARY KEY,
+        usedBytes INTEGER NOT NULL DEFAULT 0 CHECK (usedBytes >= 0),
+        updatedAt INTEGER NOT NULL
+      );
+`
+
 // Seeds affinity from the sessions that predate the table. It must START with the INSERT:
 // the PostgreSQL rewrite converts `INSERT OR IGNORE` only when it opens the statement, so
 // folding this into the CREATE above would ship SQLite syntax to a pool store. The NOT NULL
@@ -1268,7 +1333,7 @@ const DECISION_SCHEMA = `
       );
 `
 
-export const SCHEMA_VERSION = 34
+export const SCHEMA_VERSION = 35
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -1668,7 +1733,9 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean; postgres: bool
     CREATE INDEX IF NOT EXISTS decision_api_gate_evaluation_lane
       ON decision_api_gate_evaluation (orgId, agentId, protocol, seq);
     CREATE INDEX IF NOT EXISTS decision_api_gate_evaluation_decision
-      ON decision_api_gate_evaluation (orgId, agentId, protocol, decisionId, seq);`)
+      ON decision_api_gate_evaluation (orgId, agentId, protocol, decisionId, seq);`),
+  // v35 adds Source Cache accounting (source-cache.md §§9–10).
+  async (db) => await db.exec(SOURCE_CACHE_SCHEMA)
 ]
 
 // The list and the version are two halves of one fact: step `i` moves a database from
@@ -1697,6 +1764,22 @@ function parseTargets(
 /** Keep `seq` numeric whichever backend read the row. */
 function normalizeVerdict(row: DecisionVerdictRow): DecisionVerdictRow {
   return { ...row, seq: Number(row.seq) }
+}
+
+/** PostgreSQL returns BIGINT aggregates as strings; the store contract is numeric on both drivers. */
+function normalizeSourceCacheObject(row: SourceCacheObjectRow): SourceCacheObjectRow {
+  return {
+    ...row,
+    bytes: Number(row.bytes),
+    createdAt: Number(row.createdAt),
+    expiresAt: row.expiresAt === null ? null : Number(row.expiresAt),
+    lastReadAt: row.lastReadAt === null ? null : Number(row.lastReadAt),
+    referenced: Number(row.referenced)
+  }
+}
+
+function normalizeSourceCacheUsage(row: SourceCacheUsageRow): SourceCacheUsageRow {
+  return { ...row, usedBytes: Number(row.usedBytes), updatedAt: Number(row.updatedAt) }
 }
 
 export class LocalStore {
@@ -1838,6 +1921,7 @@ export class LocalStore {
       ${THREAD_PARTICIPATION_SCHEMA}
       ${DECISION_SCHEMA}
       ${APPEND_RESERVATION_SCHEMA}
+      ${SOURCE_CACHE_SCHEMA}
       -- Latest-wins session metadata awaiting a correlated CP persistence ACK.
       -- This is deliberately separate from sessions: an upgrade starts with an
       -- empty outbox and never treats historical session rows as pending work.
@@ -2438,6 +2522,165 @@ export class LocalStore {
   private async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
     await this.drainToolCallWrites()
     return this.backend.transaction(fn)
+  }
+
+  /**
+   * Reserve one Source Cache object under the org's usage-row lock. The quota check counts
+   * committed bytes plus every still-live pending reservation, then the row and usage snapshot
+   * commit together. Refusal rolls the whole transaction back and returns undefined.
+   */
+  async reserveSourceCacheObject(
+    input: SourceCacheReservationInput,
+    quotaBytes: number
+  ): Promise<SourceCacheObjectRow | undefined> {
+    if (!Number.isSafeInteger(input.bytes) || input.bytes < 0)
+      throw new Error(`source cache reservation bytes must be a non-negative safe integer, got ${input.bytes}`)
+    if (!Number.isSafeInteger(quotaBytes) || quotaBytes < 0)
+      throw new Error(`source cache quota bytes must be a non-negative safe integer, got ${quotaBytes}`)
+    if (
+      !Number.isSafeInteger(input.createdAt) ||
+      !Number.isSafeInteger(input.expiresAt) ||
+      input.expiresAt <= input.createdAt
+    )
+      throw new Error('source cache reservation expiry must be a safe timestamp after createdAt')
+
+    return rollbackAs(
+      this.transaction(async (raw) => {
+        const tx = accessOf(raw)
+        await this.lockSourceCacheUsage(tx, input.orgId, input.createdAt)
+        const usedBytes = await this.sourceCacheUsedBytes(tx, input.orgId, input.createdAt)
+        if (usedBytes + input.bytes > quotaBytes) throw new RollbackSignal()
+
+        await tx
+          .prepare(
+            `INSERT INTO source_cache_object
+               (orgId, key, kind, state, bytes, repositoryUrlHash, refHash, createdAt, expiresAt, lastReadAt, referenced)
+             VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL, 0)`
+          )
+          .run(
+            input.orgId,
+            input.key,
+            input.kind,
+            input.bytes,
+            input.repositoryUrlHash,
+            input.refHash,
+            input.createdAt,
+            input.expiresAt
+          )
+        await this.writeSourceCacheUsage(tx, input.orgId, usedBytes + input.bytes, input.createdAt)
+        return normalizeSourceCacheObject(
+          (await tx
+            .prepare('SELECT * FROM source_cache_object WHERE orgId = ? AND key = ?')
+            .get(input.orgId, input.key)) as SourceCacheObjectRow
+        )
+      }),
+      undefined
+    )
+  }
+
+  /** Flip an unexpired pending reservation to committed. A late commit after expiry loses. */
+  async commitSourceCacheObject(orgId: string, key: string, at: number): Promise<boolean> {
+    return rollbackAs(
+      this.transaction(async (raw) => {
+        const tx = accessOf(raw)
+        await this.lockSourceCacheUsage(tx, orgId, at)
+        const committed = await tx
+          .prepare(
+            `UPDATE source_cache_object
+             SET state = 'committed', expiresAt = NULL
+             WHERE orgId = ? AND key = ? AND state = 'pending' AND expiresAt > ?`
+          )
+          .run(orgId, key, at)
+        if (committed.changes !== 1) throw new RollbackSignal()
+        await this.writeSourceCacheUsage(tx, orgId, await this.sourceCacheUsedBytes(tx, orgId, at), at)
+        return true
+      }),
+      false
+    )
+  }
+
+  /**
+   * Delete expired pending rows and return them to the caller so their objects can be swept.
+   * The delete and the usage snapshot share the org lock with reservations.
+   */
+  async expireSourceCacheReservations(orgId: string, now: number): Promise<SourceCacheObjectRow[]> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      await this.lockSourceCacheUsage(tx, orgId, now)
+      const expired = (
+        await tx
+          .prepare(
+            `SELECT * FROM source_cache_object
+             WHERE orgId = ? AND state = 'pending' AND expiresAt <= ?
+             ORDER BY expiresAt ASC, key ASC`
+          )
+          .all(orgId, now)
+      ).map((row) => normalizeSourceCacheObject(row as SourceCacheObjectRow))
+      if (expired.length > 0)
+        await tx
+          .prepare("DELETE FROM source_cache_object WHERE orgId = ? AND state = 'pending' AND expiresAt <= ?")
+          .run(orgId, now)
+      await this.writeSourceCacheUsage(tx, orgId, await this.sourceCacheUsedBytes(tx, orgId, now), now)
+      return expired
+    })
+  }
+
+  /** Advance last-read monotonically; only committed objects are readable. */
+  async markSourceCacheObjectRead(orgId: string, key: string, at: number): Promise<boolean> {
+    const updated = await this.db
+      .prepare(
+        `UPDATE source_cache_object
+         SET lastReadAt = ?
+         WHERE orgId = ? AND key = ? AND state = 'committed' AND (lastReadAt IS NULL OR lastReadAt < ?)`
+      )
+      .run(at, orgId, key, at)
+    return updated.changes === 1
+  }
+
+  async getSourceCacheObject(orgId: string, key: string): Promise<SourceCacheObjectRow | undefined> {
+    const row = (await this.db
+      .prepare('SELECT * FROM source_cache_object WHERE orgId = ? AND key = ?')
+      .get(orgId, key)) as SourceCacheObjectRow | undefined
+    return row ? normalizeSourceCacheObject(row) : undefined
+  }
+
+  async sourceCacheUsage(orgId: string): Promise<SourceCacheUsageRow> {
+    const row = (await this.db
+      .prepare('SELECT orgId, usedBytes, updatedAt FROM source_cache_usage WHERE orgId = ?')
+      .get(orgId)) as SourceCacheUsageRow | undefined
+    return row ? normalizeSourceCacheUsage(row) : { orgId, usedBytes: 0, updatedAt: 0 }
+  }
+
+  private async lockSourceCacheUsage(tx: StoreAccess, orgId: string, at: number): Promise<void> {
+    await tx
+      .prepare(
+        `INSERT OR IGNORE INTO source_cache_usage (orgId, usedBytes, updatedAt)
+         VALUES (?, 0, ?)`
+      )
+      .run(orgId, at)
+    const lock = this.postgres ? ' FOR UPDATE' : ''
+    await tx.prepare(`SELECT orgId FROM source_cache_usage WHERE orgId = ?${lock}`).get(orgId)
+  }
+
+  private async sourceCacheUsedBytes(tx: StoreAccess, orgId: string, now: number): Promise<number> {
+    const row = (await tx
+      .prepare(
+        `SELECT COALESCE(SUM(CASE
+           WHEN state = 'committed' THEN bytes
+           WHEN state = 'pending' AND expiresAt > ? THEN bytes
+           ELSE 0
+         END), 0) AS usedBytes
+         FROM source_cache_object
+         WHERE orgId = ?`
+      )
+      .get(now, orgId)) as { usedBytes: number | string } | undefined
+    return Number(row?.usedBytes ?? 0)
+  }
+
+  private async writeSourceCacheUsage(tx: StoreAccess, orgId: string, usedBytes: number, at: number): Promise<void> {
+    await tx
+      .prepare('UPDATE source_cache_usage SET usedBytes = ?, updatedAt = ? WHERE orgId = ?')
+      .run(usedBytes, at, orgId)
   }
 
   async getSession(key: string): Promise<SessionRecord | undefined> {
