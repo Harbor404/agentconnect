@@ -7,6 +7,7 @@ import { MAX_FRAME_BYTES } from '@agentconnect.md/protocol'
 import { ALLOWED_GIT_SUBCOMMANDS, ExecRefusedError, createExecHandler } from '../src/shim/exec-handler.js'
 import { configFilesDir } from '../src/shim/config-file-env.js'
 import type { GitExecResult } from '../src/shim/git-exec.js'
+import { DEFAULT_SHIM_PATHS } from '../src/shim/sandbox-paths.js'
 import { workspaceGitLocalEnv } from '../src/workspace/git-injection.js'
 
 /**
@@ -348,6 +349,37 @@ describe('sandbox exec handler', () => {
       args: ['config', '--get', 'user.name']
     })) as GitExecResult
     expect(withoutEnv.stdout.trim()).not.toBe('Only From Request')
+  })
+
+  it('forces GIT_NO_LAZY_FETCH=1 for bundle create without changing argv', async () => {
+    const root = repository()
+    const stagingRoot = join(root, 'staging')
+    const fakeBin = join(root, 'fake-bin')
+    const record = join(root, 'git-invocation.json')
+    mkdirSync(stagingRoot)
+    mkdirSync(fakeBin)
+    const fakeGit = join(fakeBin, 'git')
+    writeFileSync(
+      fakeGit,
+      `#!/usr/bin/env node\nconst fs = require('node:fs')\nfs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({ lazyFetch: process.env.GIT_NO_LAZY_FETCH, args: process.argv.slice(2) }))\n`,
+      { mode: 0o755 }
+    )
+    const args = ['bundle', 'create', join(stagingRoot, 'repo.bundle'), '--filter=blob:none', 'refs/heads/main']
+    const execute = createExecHandler({
+      workspaceRoot: root,
+      paths: { ...DEFAULT_SHIM_PATHS, skillStagingDir: stagingRoot }
+    })
+    const result = (await execute('exec', {
+      tool: 'git',
+      args,
+      env: { PATH: `${fakeBin}:${process.env.PATH ?? ''}`, GIT_NO_LAZY_FETCH: '0' }
+    })) as GitExecResult
+
+    expect(result.code).toBe(0)
+    expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({
+      lazyFetch: '1',
+      args: [...args]
+    })
   })
 
   it('refuses every accepted SPELLING of an execution option, not just the separated one', async () => {

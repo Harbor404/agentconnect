@@ -1,7 +1,11 @@
+import { lstatSync, realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+
 // Share the daemon's workspace Git command inventory across sandbox transports.
 export const ALLOWED_GIT_SUBCOMMANDS = new Set([
   'add',
   'branch',
+  'bundle',
   'check-ref-format',
   'checkout',
   'clean',
@@ -62,7 +66,161 @@ export class ExecRefusedError extends Error {
   }
 }
 
-export function validateGitArgs(args: string[]): void {
+export interface GitCommandPolicyOptions {
+  /** The only directory in which a write-back bundle may be created. */
+  stagingRoot: string
+}
+
+const BUNDLE_URI = '--bundle-uri'
+const BUNDLE_FILTER = '--filter=blob:none'
+const MAX_BUNDLE_URI_LENGTH = 8 * 1024
+const MAX_REF_LENGTH = 1024
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/
+const SAFE_BUNDLE_PATH_SEGMENT = /^[A-Za-z0-9._-]+$/
+const SAFE_REF_COMPONENT = /^[\p{L}\p{N}._-]+$/u
+
+function refuse(message: string): never {
+  throw new ExecRefusedError(message)
+}
+
+function validateBundleUri(uri: string, subcommand: string): void {
+  if (subcommand !== 'clone') refuse(`${BUNDLE_URI} is only permitted for git clone`)
+  if (uri.length === 0 || uri.length > MAX_BUNDLE_URI_LENGTH || CONTROL_CHARACTER.test(uri) || /\s/.test(uri)) {
+    refuse(`${BUNDLE_URI} must be a bounded HTTPS URL`)
+  }
+  if (!uri.startsWith('https://')) refuse(`${BUNDLE_URI} must use https://`)
+  let url: URL
+  try {
+    url = new URL(uri)
+  } catch {
+    refuse(`${BUNDLE_URI} is not a valid URL`)
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname === '' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.hash !== ''
+  ) {
+    refuse(`${BUNDLE_URI} must be a credential-free HTTPS URL without a fragment`)
+  }
+}
+
+function validateBundleUris(args: string[]): void {
+  const [subcommand, ...rest] = args
+  let seen = false
+  for (let index = 0; index < rest.length; index += 1) {
+    const argument = rest[index]!
+    if (argument === BUNDLE_URI) {
+      const value = rest[index + 1]
+      if (value === undefined) refuse(`${BUNDLE_URI} requires an HTTPS URL`)
+      validateBundleUri(value, subcommand ?? '')
+      seen = true
+      index += 1
+      continue
+    }
+    if (argument.startsWith(`${BUNDLE_URI}=`)) {
+      validateBundleUri(argument.slice(BUNDLE_URI.length + 1), subcommand ?? '')
+      seen = true
+      continue
+    }
+    if (argument.startsWith(BUNDLE_URI)) refuse(`argument ${argument} is not an accepted bundle URI spelling`)
+  }
+  if (seen && subcommand !== 'clone') refuse(`${BUNDLE_URI} is only permitted for git clone`)
+  if (seen && rest.filter((argument) => argument === BUNDLE_URI || argument.startsWith(`${BUNDLE_URI}=`)).length > 1) {
+    refuse(`${BUNDLE_URI} may be supplied once`)
+  }
+}
+
+/** Resolve a possibly-not-yet-existing path without following a symlink out of the staging root. */
+function canonicalPotential(path: string): string {
+  const absolute = normalize(resolve(path))
+  const missing: string[] = []
+  let current = absolute
+  while (true) {
+    try {
+      lstatSync(current)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') refuse(`cannot inspect bundle path: ${path}`)
+      const parent = dirname(current)
+      if (parent === current) refuse(`cannot resolve bundle path: ${path}`)
+      missing.unshift(basename(current))
+      current = parent
+      continue
+    }
+    try {
+      const existing = realpathSync(current)
+      return missing.length === 0 ? existing : join(existing, ...missing)
+    } catch {
+      refuse(`bundle path contains a broken symlink: ${path}`)
+    }
+  }
+}
+
+function validateBundleFile(stagingRoot: string | undefined, file: string): void {
+  if (!stagingRoot) refuse('bundle create requires a staging root')
+  if (!isAbsolute(file)) refuse('bundle output file must be absolute')
+  if (CONTROL_CHARACTER.test(file)) refuse('bundle output file contains a control character')
+  if (basename(file).length <= '.bundle'.length || !basename(file).endsWith('.bundle')) {
+    refuse('bundle output file must end in .bundle')
+  }
+  try {
+    lstatSync(file)
+    refuse('bundle output file already exists')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+
+  const root = canonicalPotential(stagingRoot)
+  const target = canonicalPotential(file)
+  if (target === root || !target.startsWith(root + sep)) refuse(`bundle output escapes the staging root: ${file}`)
+  const relative = target.slice(root.length + sep.length)
+  if (relative.split(sep).some((part) => !SAFE_BUNDLE_PATH_SEGMENT.test(part))) {
+    refuse('bundle output path contains an unsafe segment')
+  }
+}
+
+function validateBundleRef(ref: string): void {
+  if (ref.length === 0 || ref.length > MAX_REF_LENGTH || CONTROL_CHARACTER.test(ref) || /\s/.test(ref)) {
+    refuse('bundle ref must be a bounded full ref name')
+  }
+  if (ref.includes('..') || ref.includes('@{')) refuse('bundle ref contains an unsafe sequence')
+  const parts = ref.split('/')
+  if (parts.length < 3 || parts[0] !== 'refs' || !['heads', 'tags'].includes(parts[1] ?? '')) {
+    refuse('bundle ref must name refs/heads/* or refs/tags/*')
+  }
+  if (
+    parts.some(
+      (part) =>
+        part.length === 0 ||
+        part === '.' ||
+        part === '..' ||
+        part.startsWith('.') ||
+        part.endsWith('.') ||
+        part.endsWith('.lock') ||
+        !SAFE_REF_COMPONENT.test(part)
+    )
+  ) {
+    refuse('bundle ref contains an unsafe segment')
+  }
+}
+
+function validateBundleCreate(subcommand: string, rest: string[], options: GitCommandPolicyOptions | undefined): void {
+  if (subcommand !== 'bundle') return
+  if (rest.length !== 3 && rest.length !== 4)
+    refuse('git bundle is admitted only as bundle create <file> [--filter=blob:none] <ref>')
+  if (rest[0] !== 'create') refuse('git bundle is admitted only for create')
+  const file = rest[1]
+  const maybeFilter = rest.length === 4 ? rest[2] : undefined
+  const ref = rest.at(-1)
+  if (!file || !ref) refuse('git bundle create requires a file and ref')
+  if (maybeFilter !== undefined && maybeFilter !== BUNDLE_FILTER)
+    refuse('git bundle create accepts only --filter=blob:none')
+  validateBundleFile(options?.stagingRoot, file)
+  validateBundleRef(ref)
+}
+
+export function validateGitArgs(args: string[], options?: GitCommandPolicyOptions): void {
   const [subcommand, ...rest] = args
   if (!subcommand || !ALLOWED_GIT_SUBCOMMANDS.has(subcommand)) {
     throw new ExecRefusedError(`git ${subcommand ?? '(none)'} is not in the permitted inventory`)
@@ -78,4 +236,6 @@ export function validateGitArgs(args: string[]): void {
       throw new ExecRefusedError(`argument ${argument} is refused for git ${subcommand}`)
     }
   }
+  validateBundleUris(args)
+  validateBundleCreate(subcommand, rest, options)
 }

@@ -128,7 +128,7 @@ export function createExecHandler(
       await applyFileSinkPayload(payload)
       return null
     }
-    if (capability === 'exec') return runGit(payload, deps, abort)
+    if (capability === 'exec') return runGit(payload, deps, paths.skillStagingDir, abort)
     if (capability === 'probe') return probeRuntimes(deps, abort)
     if (capability === 'skills') {
       if (typeof payload !== 'object' || payload === null || !('cwd' in payload)) {
@@ -207,9 +207,14 @@ async function probeRuntimes(deps: ExecHandlerDeps, abort?: AbortSignal): Promis
   })
 }
 
-async function runGit(payload: unknown, deps: ExecHandlerDeps, abort?: AbortSignal): Promise<GitExecResult> {
+async function runGit(
+  payload: unknown,
+  deps: ExecHandlerDeps,
+  stagingRoot: string,
+  abort?: AbortSignal
+): Promise<GitExecResult> {
   const parsed = GitExecPayloadSchema.parse(payload)
-  validateGitArgs(parsed.args)
+  validateGitArgs(parsed.args, { stagingRoot })
   const [subcommand, ...rest] = parsed.args
   const cwd = resolveCwd(deps.workspaceRoot, parsed.cwd)
   // Both WRITE a path from argv, which the cwd fence never looks at: a clone's target, and the
@@ -227,7 +232,8 @@ async function runGit(payload: unknown, deps: ExecHandlerDeps, abort?: AbortSign
   // it keeps holding index.lock after the caller has given up.
   const timeoutMs = Math.min(parsed.timeoutMs ?? DEFAULT_TIMEOUT_MS, deps.timeoutMs ?? MAX_TIMEOUT_MS)
   // Inside SRT the holder's empty proxy pins would leave no route out, so they name the boundary's own bridge (session-executors.md §5).
-  const env = srtGitEnv(parsed.env, deps.shimEnv ?? process.env)
+  const baseEnv = srtGitEnv(parsed.env, deps.shimEnv ?? process.env)
+  const env = subcommand === 'bundle' ? { ...baseEnv, GIT_NO_LAZY_FETCH: '1' } : baseEnv
   return await new Promise<GitExecResult>((resolvePromise, reject) => {
     execFile(
       'git',
