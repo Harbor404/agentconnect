@@ -115,6 +115,8 @@ export default defineConfig({
     // resources. Four on Windows too: the halving there bought time for inline per-test budgets that
     // no longer exist, and the polls those budgets never governed now scale in `test/wait-support.ts`.
     maxWorkers: 4,
+    // One temp dir per run, removed at teardown, so the suite's `mkdtemp` roots stop piling up in `/tmp`.
+    globalSetup: ['./test/tmpdir-global-setup.ts'],
     sequence: { sequencer: weightBalancedSequencer(SHARD_WEIGHTS, SHARD_WEIGHT_FALLBACK) },
     // The async store pays a microtask hop per statement; on a loaded CI box the IO-heavy store files
     // drift past vitest's 5 s default without being hung. Windows I/O is slower again by enough that
