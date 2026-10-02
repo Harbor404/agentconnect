@@ -31,13 +31,27 @@ export const ALLOWED_GIT_SUBCOMMANDS = new Set([
 ])
 
 // Refuse execution options in every accepted spelling.
-const REFUSED_ARGUMENT = [
-  /^-c/, // ad-hoc config in any spelling: -c k=v, -ck=v
-  /^--config/, // --config=k=v, --config-env=…
-  /^--exec-path/, // relocates git's helper binaries
-  /^--upload-pack/,
-  /^--receive-pack/
+const REFUSED_LONG_OPTIONS = [
+  '--config', // --config=k=v
+  '--config-env',
+  '--exec-path', // relocates git's helper binaries
+  '--upload-pack',
+  '--receive-pack'
 ]
+const REFUSED_SHORT_ARGUMENT = /^-c/ // ad-hoc config in any spelling: -c k=v, -ck=v
+
+function optionPart(argument: string): string {
+  const equals = argument.indexOf('=')
+  return equals === -1 ? argument : argument.slice(0, equals)
+}
+
+function isRefusedArgument(argument: string): boolean {
+  if (REFUSED_SHORT_ARGUMENT.test(argument)) return true
+  const option = optionPart(argument)
+  return REFUSED_LONG_OPTIONS.some(
+    (refused) => option.length > 2 && (refused.startsWith(option) || option.startsWith(refused))
+  )
+}
 
 // These spellings reach execution only for the named subcommand.
 const REFUSED_SUBCOMMAND_ARGUMENT: Record<string, RegExp[]> = {
@@ -250,7 +264,7 @@ export function validateGitArgs(args: string[], options?: GitCommandPolicyOption
   }
   const perSubcommand = REFUSED_SUBCOMMAND_ARGUMENT[subcommand] ?? []
   for (const argument of args) {
-    if (REFUSED_ARGUMENT.some((pattern) => pattern.test(argument))) {
+    if (isRefusedArgument(argument)) {
       throw new ExecRefusedError(`argument ${argument} is refused`)
     }
   }

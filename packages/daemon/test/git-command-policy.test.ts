@@ -27,6 +27,41 @@ function refused(args: string[], stagingRoot: string): void {
 }
 
 describe('Git command policy', () => {
+  it('refuses long-option abbreviations that reach execution-sensitive Git options', () => {
+    const { stagingRoot } = fixture()
+    const remote = 'https://github.com/acme/repo.git'
+    for (const args of [
+      ['clone', '--upload-pack=sh -c "id"', remote, 'repo'],
+      ['clone', '--upload=sh -c "id"', remote, 'repo'],
+      ['clone', '--upl=sh -c "id"', remote, 'repo'],
+      ['fetch', '--upload=sh -c "id"', 'origin'],
+      ['push', '--receive-pack=sh -c "id"', 'origin'],
+      ['push', '--receive=sh -c "id"', 'origin'],
+      ['status', '--exec-path=/tmp/evil'],
+      ['status', '--exec=/tmp/evil'],
+      ['status', '--config=core.pager=evil'],
+      ['status', '--conf=core.pager=evil'],
+      ['status', '--config-env=core.pager=EVIL'],
+      ['status', '--config-e=core.pager=EVIL']
+    ]) {
+      refused(args, stagingRoot)
+    }
+  })
+
+  it('continues to accept ordinary long options in admitted Git flows', () => {
+    const { stagingRoot } = fixture()
+    const remote = 'https://github.com/acme/repo.git'
+    for (const args of [
+      ['clone', '--filter=blob:none', '--no-checkout', '--single-branch', remote, 'repo'],
+      ['status', '--short', '--branch'],
+      ['log', '--oneline', '--decorate'],
+      ['config', '--get', 'user.name'],
+      ['remote', '--verbose']
+    ]) {
+      allowed(args, stagingRoot)
+    }
+  })
+
   it('accepts both Git spellings of an HTTPS bundle URI', () => {
     const { stagingRoot } = fixture()
     for (const args of [
