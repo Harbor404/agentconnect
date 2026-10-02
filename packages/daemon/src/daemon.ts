@@ -712,7 +712,7 @@ import { type ConfigApply } from './cp/config-apply.js'
 import { buildConfigApply, type ConfigApplyHost } from './cp/config-apply-handlers.js'
 import { SystemMetrics } from './metrics/system-metrics.js'
 import { estimateOpenAiTurnCost } from './usage/openai-public-pricing.js'
-import type { McpServer } from '@agentclientprotocol/sdk'
+import type { McpServer, SessionUpdate } from '@agentclientprotocol/sdk'
 import type { Agent, CronDef, Integration } from './agents/agent-schema.js'
 import {
   appendTurnPrompt,
@@ -10858,9 +10858,17 @@ export class Daemon {
       // A hook's stored selection names the runtime even after its host stops.
       storedSessionExecution: async (agentId, acpSessionId) => {
         const rec = await this.store.getSessionByAcpIdForAgent(agentId, acpSessionId)
+        const pending = rec
+          ? this.pending.get(pendingTurnKey(this.sessionOwnerKey(agentId, rec.key), acpSessionId))
+          : undefined
         return {
           host: rec ? this.hostForOwner(this.sessionOwnerKey(agentId, rec.key)) : this.hosts.get(agentHostKey(agentId)),
-          target: pinnedDecisionTarget(rec?.decisionModel)
+          target: pinnedDecisionTarget(rec?.decisionModel),
+          // During a turn, its initial selector snapshot must not override newer live model information.
+          observed:
+            rec && (!pending || pending.signals.runtimeReportedModel)
+              ? await this.store.getObservedTurn(rec.key)
+              : undefined
         }
       }
     }
@@ -13990,6 +13998,7 @@ export class Daemon {
       this.emitTurnStarted(run, host, sessionId, created, prompt.finalCaptureInput, turnModel)
       const outcome = await this.runPromptLoop(p, run, { ...prompt, host, sessionId, turnModel, settlement })
       if (outcome.kind === 'cancelled') return null
+      if (!p.signals.runtimeReportedModel) turnModel = await this.captureTurnModel(run, host, sessionId, modelOverride)
       await this.settleUsage(p, run, sessionId)
       await this.commitWebchatReply(p, run, outcome)
       await this.flushPlatformFinals(p, run, sessionId, currentAttributionInfo)
@@ -15149,18 +15158,8 @@ export class Daemon {
     if (selectedModel && this.modelSessions.crossesHostProvider(key, agentId, selectedModel)) {
       // A live host can only use the provider credentials it started with.
       this.log.debug('model selection deferred — host is bound to its start-time provider')
-    } else if (selectedModel) {
-      const applied =
-        host.modelOptions?.(sessionId)?.current === selectedModel ||
-        (await host.setSessionModel(sessionId, selectedModel).catch(() => false))
-      if (
-        !applied &&
-        !override &&
-        runtimeAgent?.runtimeOverrides?.model &&
-        !this.modelSessions.crossesHostProvider(key, agentId, runtimeAgent.runtimeOverrides.model)
-      ) {
-        await host.setSessionModel(sessionId, runtimeAgent.runtimeOverrides.model).catch(() => false)
-      }
+    } else if (selectedModel && host.modelOptions?.(sessionId)?.current !== selectedModel) {
+      await host.setSessionModel(sessionId, selectedModel)
     }
     // Apply effort after the model, which determines the offered levels.
     const effortOverride =
@@ -16261,8 +16260,7 @@ export class Daemon {
     )
   }
 
-  /** This turn's live attribution facts. Re-read per call: a runtime may only publish its final
-   *  session-scoped model during the prompt. */
+  /** Prefer execution evidence, then the live selector, which can change during the prompt. */
   private async turnAttributionInfo(
     p: Pending,
     run: TurnRun,
@@ -16274,7 +16272,7 @@ export class Daemon {
       botName: agent.name,
       botUrl: this.agentLink(entry.agentId),
       runtime: this.runtimeFacts.runtimeNames()[agent.runtime] ?? agent.runtime,
-      model: (await this.buildStatusInfo(p)).model ?? turnModel ?? 'default',
+      model: p.signals.runtimeReportedModel ?? (await this.buildStatusInfo(p)).model ?? turnModel ?? 'default',
       sessionUrl: this.sessionLink(p.outwardSessionId, this.sessionLinkSource(plan.platform, plan.integrationId)),
       ...(plan.hopLimitNotice ? { notice: plan.hopLimitNotice } : {})
     }
@@ -18130,6 +18128,31 @@ export class Daemon {
     return maskSecretsDeep(payload, maskableSecrets(this.agents.get(agentId)))
   }
 
+  /** Keep native usage and the runtime's concrete model together, including notifications after turn completion. */
+  private async recordRuntimeUsageSnapshot(
+    key: string,
+    update: Extract<SessionUpdate, { sessionUpdate: 'usage_update' }>
+  ): Promise<string | undefined> {
+    await this.store.setUsageSnapshot(key, {
+      contextUsed: update.used,
+      contextSize: update.size,
+      costAmount: update.cost?.amount ?? undefined,
+      costCurrency: update.cost?.currency ?? undefined
+    })
+    // Claude ACP reports the top-level assistant model here even while its selector stays on "default".
+    const reported = update._meta?.['_claude/model']
+    const model = typeof reported === 'string' ? reported.trim() : ''
+    if (!model || model === 'default' || model === '<synthetic>') return
+    const observed = await this.store.getObservedTurn(key)
+    if (!observed?.runtime) return
+    if (observed.model !== model) {
+      await this.store.setObservedTurn(key, observed.runtime, model)
+      const rec = await this.store.getSession(key)
+      if (rec) await this.reportSessionStatus(rec)
+    }
+    return model
+  }
+
   /** Emit the daemon's latest merged usage snapshot. Used both at normal turn end
    *  and when a late ACP usage_update corrects an already-reported fallback. */
   private async emitStoredUsageReport(
@@ -18356,12 +18379,7 @@ export class Daemon {
       // platform delivery and evaluation telemetry.
       if (update?.sessionUpdate === 'usage_update' && extraction.sessionKey) {
         if (update.cost?.amount !== undefined) extraction.runtimeCostReported = true
-        await this.store.setUsageSnapshot(extraction.sessionKey, {
-          contextUsed: update.used,
-          contextSize: update.size,
-          costAmount: update.cost?.amount ?? undefined,
-          costCurrency: update.cost?.currency ?? undefined
-        })
+        await this.recordRuntimeUsageSnapshot(extraction.sessionKey, update)
       }
       return
     }
@@ -18374,12 +18392,7 @@ export class Daemon {
       if (extractionQuarantineOwner === agentId && update?.sessionUpdate === 'usage_update') {
         const rec = await this.sessionForAcp(owner, sessionId)
         if (rec?.platform === 'dream') {
-          await this.store.setUsageSnapshot(rec.key, {
-            contextUsed: update.used,
-            contextSize: update.size,
-            costAmount: update.cost?.amount ?? undefined,
-            costCurrency: update.cost?.currency ?? undefined
-          })
+          await this.recordRuntimeUsageSnapshot(rec.key, update)
           await this.emitStoredUsageReport(sessionId, agentId, rec.platform, rec.channel, rec.key, true)
         }
       }
@@ -18468,12 +18481,8 @@ export class Daemon {
       const key = p?.plan.sessionKey ?? rec?.key
       if (key) {
         if (p && update.cost?.amount !== undefined) p.signals.runtimeCostReported = true
-        await this.store.setUsageSnapshot(key, {
-          contextUsed: update.used,
-          contextSize: update.size,
-          costAmount: update.cost?.amount ?? undefined,
-          costCurrency: update.cost?.currency ?? undefined
-        })
+        const reportedModel = await this.recordRuntimeUsageSnapshot(key, update)
+        if (p && reportedModel) p.signals.runtimeReportedModel = reportedModel
         if (p) {
           // Live context/cost changed — refresh the status bar (deduped if nothing observable
           // moved). Token totals aren't in this stream; they fold in at turn end.

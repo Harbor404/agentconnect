@@ -30,7 +30,7 @@ export default defineConfig({
       'test/postgres-transcript-org.int.test.ts',
       'test/postgres-intake-migration.int.test.ts'
     ],
-    globalSetup: ['./test/store-postgres/global-setup.ts'],
+    globalSetup: ['./test/tmpdir-global-setup.ts', './test/store-postgres/global-setup.ts'],
     setupFiles: ['./test/store-postgres/setup.ts'],
     maxWorkers: storePostgresWorkerCount(),
     fileParallelism: true,
