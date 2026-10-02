@@ -89,6 +89,11 @@ full diagnostic stays in the daemon log.
 A runtime that failed to start because its own installation is incomplete is repaired
 and retried automatically before the agent is reported as unavailable at all.
 
+When a runtime offers model selection but rejects an explicitly selected model, the
+turn stops and reports the requested model with the runtime's detailed cause. It must
+not silently run on a different model. Session metadata, usage, and reply attribution
+prefer the concrete model reported during execution over a selector's `default` alias.
+
 A runtime-reported terminal failure is a failed turn even when its prompt response says
 `end_turn`. When the runtime explicitly offers a retry and no tool or answer has started,
 the daemon retries once after five seconds within the same admitted task. A review keeps
@@ -1108,6 +1113,11 @@ failure names the usage limit in the Check title. A submitted formal verdict
 remains authoritative (`REQUEST_CHANGES` stays `action_required`), and an ambiguous
 formal-review write remains a visible failure until it is reconciled. An active
 terminal failure keeps the `Request review` action for a new attempt after the cause is resolved.
+
+An inline review comment must name a line or range in the pull request's diff. Invalid
+positions return an actionable error before publication, so the Agent can correct them
+or move the finding into the review body and retry within the same authorized turn.
+GitHub rejection details are returned to the Agent without changing the review verdict.
 
 A review turn the platform itself ended — the Agent stopped being served where it was
 running — is a distinct outcome from a review that ran and could not conclude, and must not
