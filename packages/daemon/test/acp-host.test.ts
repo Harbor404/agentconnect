@@ -5,6 +5,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import {
   AcpHost,
+  ModelSelectionError,
   claudeSessionMeta,
   isOAuthRefreshContention,
   shouldForwardUpdateDuringLoad,
@@ -197,6 +198,21 @@ describe('AcpHost (against a fake ACP agent)', () => {
     expect(mode()?.currentValue).toBe('agent-full-access')
     await host.stop()
   })
+
+  // The dream gate re-asserts the read-only mode the configured settings just applied (#2774).
+  it('reports a mode the session already holds as in effect, and an unoffered one as not', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      { onUpdate: () => {}, env: { AC_PERMISSION_MODES: 'agent,read-only' } }
+    )
+    await host.start()
+    const sessionId = await host.newSession('/tmp')
+    await expect(host.setSessionPermissionMode(sessionId, 'read-only')).resolves.toBe(true)
+    await expect(host.setSessionPermissionMode(sessionId, 'read-only')).resolves.toBe(true)
+    expect(host.permissionModeOptions(sessionId)?.current).toBe('read-only')
+    await expect(host.setSessionPermissionMode(sessionId, 'plan')).resolves.toBe(false)
+    await host.stop()
+  })
 })
 
 describe('AcpHost.mcpCapabilities (MCP transports from initialize)', () => {
@@ -354,6 +370,35 @@ describe('claudeSessionMeta (system prompt + memory index over _meta)', () => {
     expect(claudeSessionMeta(undefined, false, 'seed', 'mem')).toBeUndefined()
   })
 
+  // Claude saves an oversized tool result under its own `.claude/projects/…/tool-results/` and tells the model to read
+  // it there: the runtime's state is read back, never changed, while its credentials stay neither read nor changed.
+  it('denies credentials to Read and Edit, and the runtime state it reads back to Edit alone', () => {
+    const meta = claudeSessionMeta(
+      undefined,
+      true,
+      undefined,
+      undefined,
+      ['/home/s/.claude.json'],
+      undefined,
+      false,
+      [],
+      [],
+      ['/home/s/.claude']
+    )!
+    const deny = meta.claudeCode.options.settings!.permissions!.deny
+    expect(deny).toEqual([
+      'Read(//home/s/.claude.json)',
+      'Read(//home/s/.claude.json/**)',
+      'Edit(//home/s/.claude.json)',
+      'Edit(//home/s/.claude.json/**)',
+      'Edit(//home/s/.claude)',
+      'Edit(//home/s/.claude/**)'
+    ])
+    const filesystem = meta.claudeCode.options.sandbox!.filesystem
+    expect(filesystem.denyRead).toEqual(['/home/s/.claude.json'])
+    expect(filesystem.denyWrite).toEqual(['/home/s/.claude.json', '/home/s/.claude'])
+  })
+
   it('omits systemPrompt when neither seed nor memory is set', () => {
     expect(claudeSessionMeta(undefined, true)?.systemPrompt).toBeUndefined()
   })
@@ -376,6 +421,41 @@ describe('claudeSessionMeta (system prompt + memory index over _meta)', () => {
 })
 
 describe('AcpHost.setSessionModel (mid-session model switch)', () => {
+  it.each(['new', 'load', 'switch'] as const)(
+    'surfaces a rejected model and its provider detail on %s',
+    async (operation) => {
+      const host = new AcpHost(
+        { command: process.execPath, args: [fakeAgent], env: [] },
+        {
+          onUpdate: () => {},
+          configPrefs: operation === 'switch' ? undefined : { model: 'model-b' },
+          env: { AC_MODELS: 'model-a,model-b', AC_MODEL_ERROR: 'This model requires usage credits.' }
+        }
+      )
+      await host.start()
+      try {
+        let sessionId = 'persisted'
+        if (operation === 'switch') sessionId = await host.newSession('/tmp')
+        const request =
+          operation === 'new'
+            ? host.newSession('/tmp', [], undefined, undefined, [], (id) => {
+                sessionId = id
+              })
+            : operation === 'load'
+              ? host.loadSession(sessionId, '/tmp')
+              : host.setSessionModel(sessionId, 'model-b')
+        await expect(request).rejects.toMatchObject({
+          name: 'ModelSelectionError',
+          message: 'Could not select model "model-b": This model requires usage credits.'
+        })
+        expect(host.hasSession(sessionId)).toBe(operation === 'switch')
+        expect(host.modelOptions(sessionId)?.current).toBe(operation === 'switch' ? 'model-a' : undefined)
+      } finally {
+        await host.stop()
+      }
+    }
+  )
+
   it('applies an offered model to a live session and refreshes modelOptions; rejects bad inputs', async () => {
     const host = new AcpHost(
       { command: process.execPath, args: [fakeAgent], env: [] },
@@ -390,17 +470,17 @@ describe('AcpHost.setSessionModel (mid-session model switch)', () => {
     expect(host.modelOptions()?.current).toBe('model-b')
     expect(host.modelOptions(sid)?.current).toBe('model-b')
 
-    // A second session refreshes the host-global compatibility cache, but the
-    // first session must retain its own selector for per-turn pricing/status.
+    // Each session retains its own selector even when another session refreshes the global cache.
     const sid2 = await host.newSession('/tmp')
     expect(host.modelOptions()?.current).toBe('model-a')
     expect(host.modelOptions(sid)?.current).toBe('model-b')
     expect(host.modelOptions(sid2)?.current).toBe('model-a')
     expect(host.modelOptions('s-unknown')).toBeNull()
 
-    // already selected → no-op false; unoffered value → false; unknown session → false
-    expect(await host.setSessionModel(sid, 'model-b')).toBe(false)
-    expect(await host.setSessionModel(sid, 'nope')).toBe(false)
+    // An unchanged model is already in effect; an unavailable one is an error; unknown sessions are no-ops.
+    expect(await host.setSessionModel(sid, 'model-b')).toBe(true)
+    expect(host.modelOptions(sid)?.current).toBe('model-b')
+    await expect(host.setSessionModel(sid, 'nope')).rejects.toBeInstanceOf(ModelSelectionError)
     expect(await host.setSessionModel('s-unknown', 'model-a')).toBe(false)
     await host.stop()
   })

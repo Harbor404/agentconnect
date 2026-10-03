@@ -3832,33 +3832,6 @@ describe.skipIf(pg)('decision table migrations', () => {
     expect(userVersion(path)).toBe(SCHEMA_VERSION)
   })
 
-  it('adds Source Cache accounting tables to a v34 store', async () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v34-')), 'local.sqlite')
-    await (await LocalStore.open(path)).close()
-    const old = new DatabaseSync(path)
-    old.exec('DROP TABLE source_cache_object; DROP TABLE source_cache_usage; PRAGMA user_version = 34')
-    old.close()
-
-    const upgraded = await LocalStore.open(path)
-    expect(
-      await upgraded.reserveSourceCacheObject(
-        {
-          orgId: 'org',
-          key: 'bundles/a.bundle',
-          kind: 'bundle',
-          bytes: 1,
-          repositoryUrlHash: 'repo',
-          refHash: 'ref',
-          createdAt: 1,
-          expiresAt: 2
-        },
-        1
-      )
-    ).toMatchObject({ orgId: 'org', key: 'bundles/a.bundle', state: 'pending' })
-    await upgraded.close()
-    expect(userVersion(path)).toBe(SCHEMA_VERSION)
-  })
-
   it('adds both tables to a v25 store', async () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v25-')), 'local.sqlite')
     await (await LocalStore.open(path)).close()
@@ -3874,6 +3847,24 @@ describe.skipIf(pg)('decision table migrations', () => {
       'decision_release',
       'decision_verdict'
     ])
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('adds the Source Cache tables to a v34 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v34-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE source_cache_object; DROP TABLE source_cache_usage; PRAGMA user_version = 34')
+    old.close()
+    const upgraded = await LocalStore.open(path)
+    expect(await upgraded.sourceCacheUsage('org-a', 1)).toEqual({ committedBytes: 0, pendingBytes: 0 })
+    await upgraded.close()
+    const check = new DatabaseSync(path)
+    const names = check
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'source_cache_%' ORDER BY name")
+      .all() as { name: string }[]
+    check.close()
+    expect(names.map((row) => row.name)).toEqual(['source_cache_object', 'source_cache_usage'])
     expect(userVersion(path)).toBe(SCHEMA_VERSION)
   })
 

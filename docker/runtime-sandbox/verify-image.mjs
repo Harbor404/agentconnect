@@ -8,6 +8,8 @@
 import { execFileSync } from 'node:child_process'
 import { builtinModules } from 'node:module'
 
+import { honorsNoLazyFetch, NO_LAZY_FETCH_FLOOR, parseGitVersion, SOURCE_CACHE_GIT_PROBE } from './source-cache-git.mjs'
+
 const variant = process.argv[2]
 if (!['runtime-sandbox', 'runtime-sandbox-full'].includes(variant)) {
   process.stderr.write('usage: verify-image.mjs runtime-sandbox|runtime-sandbox-full\n')
@@ -79,6 +81,17 @@ check('runs as a non-root user', () => {
   const uid = sh('id -u')
   if (uid === '0') throw new Error('image runs as root')
   return `uid ${uid}`
+})
+
+check('Git supports the Source Cache bundle primitives', () => {
+  const output = sh('git --version')
+  const version = parseGitVersion(output)
+  if (!honorsNoLazyFetch(version)) {
+    const { major, minor, patch } = version
+    throw new Error(`Git ${major}.${minor}.${patch} does not honor GIT_NO_LAZY_FETCH (needs ${NO_LAZY_FETCH_FLOOR})`)
+  }
+  sh(SOURCE_CACHE_GIT_PROBE)
+  return `${output}; refs/heads blob:none bundle, --bundle-uri import under refs/bundles, fsck and GIT_NO_LAZY_FETCH work`
 })
 
 if (variant === 'runtime-sandbox-full') {

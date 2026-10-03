@@ -633,6 +633,7 @@ import {
 } from './runtimes/read-roots.js'
 import { nodeExecArgvModuleEntries } from './runtimes/node-exec-argv.js'
 import { makeLogger, type Logger } from './log.js'
+import { createSourceCache, type SourceCache, type SourceCachePresigner } from './source-cache/index.js'
 import { CpClient } from './cp/client.js'
 import { RelayManager } from './cp/relay-manager.js'
 import { CP_IDENTITY_TOKEN_PATH, readClusterIdentityToken } from './cp/cluster-identity.js'
@@ -712,7 +713,7 @@ import { type ConfigApply } from './cp/config-apply.js'
 import { buildConfigApply, type ConfigApplyHost } from './cp/config-apply-handlers.js'
 import { SystemMetrics } from './metrics/system-metrics.js'
 import { estimateOpenAiTurnCost } from './usage/openai-public-pricing.js'
-import type { McpServer } from '@agentclientprotocol/sdk'
+import type { McpServer, SessionUpdate } from '@agentclientprotocol/sdk'
 import type { Agent, CronDef, Integration } from './agents/agent-schema.js'
 import {
   appendTurnPrompt,
@@ -1578,6 +1579,8 @@ export class Daemon {
   private readonly codexSessionFloor?: string
   private readonly claudeModelAliases?: Record<string, string>
   private readonly runtimeEnvironment: RuntimeEnvironment
+  /** The pool member's Source Cache signer; undefined outside --k8s or when no bucket is configured. */
+  private readonly sourceCache?: SourceCache
   /** Reads this pod's projected CP-audience token; undefined unless the daemon runs
    *  in-cluster AND the volume is actually mounted (decided once, at boot). */
   private readonly clusterIdentityToken?: () => string | undefined
@@ -1881,6 +1884,8 @@ export class Daemon {
       keyServerClient?: KeyServerClient
       /** Test seam for the daemon-private memory-plugin transport. */
       memoryPluginConnect?: MemoryPluginConnector
+      /** Test seam for the Source Cache's STS calls. */
+      sourceCacheFetch?: typeof fetch
       /** Optional, observer-only evaluation surface and add-on treatment. */
       evaluation?: DaemonEvaluationOptions
     } = {}
@@ -1912,6 +1917,12 @@ export class Daemon {
     // supplies the key alone.
     this.modelSessions.staticModelCredentials = this.k8s ? configuredModelCredentials(process.env) : undefined
     this.runtimeEnvironment = this.k8s ? configuredRuntimeEnvironment(process.env) : {}
+    this.sourceCache = createSourceCache({
+      env: process.env,
+      k8s: this.k8s,
+      ...(opts.sourceCacheFetch ? { fetch: opts.sourceCacheFetch } : {}),
+      log: { info: (m) => this.log.info(m), warn: (m) => this.log.warn(m) }
+    })
     this.decisionEvaluator = new DecisionEvaluator({
       orgForAgent: (agentId) => this.orgForAgent(agentId),
       credentials: (request, signal) => {
@@ -2981,6 +2992,11 @@ export class Daemon {
       log: { info: (m) => this.log.info(m), warn: (m) => this.log.warn(m) }
     })
     probeGitVersion((m) => this.log.warn(m))
+  }
+
+  /** The Source Cache presigner later clone and write-back paths consume; undefined when not configured. */
+  sourceCacheSigner(): SourceCachePresigner | undefined {
+    return this.sourceCache?.presigner
   }
 
   /** Phase 6 — settle this daemon id (minted locally only when the CP will not assign one) and rebuild the logger at the configured level. */
@@ -6703,6 +6719,9 @@ export class Daemon {
     const remoteHome = remoteSession && this.executorPlane?.homeFor(remoteSession.subject)
     // The roots its `prepare` named, where the session gitconfig and config files land in that machine's environment (§5).
     const remoteRoots = remoteSession && this.executorPlane?.rootsFor(remoteSession.sessionKey)
+    // Its `.codex` as that machine classified it, which this one cannot list (prepareExecutorLaunch).
+    const remoteCodexState =
+      remoteSession && remoteHome ? this.executorPlane?.codexStateFor(remoteSession.subject, remoteHome) : undefined
     if (remoteSession && (!remoteHome || !remoteRoots)) {
       throw new Error(
         `session ${remoteSession.leaf} has no environment on daemon ${remoteSession.executorDaemonId} to launch in — its next turn prepares one`
@@ -6856,7 +6875,9 @@ export class Daemon {
               }
             }
           : {}),
-        ...(remoteHome ? { executor: { home: remoteHome } } : {}),
+        ...(remoteHome
+          ? { executor: { home: remoteHome, ...(remoteCodexState ? { codexState: remoteCodexState } : {}) } }
+          : {}),
         ...(opts.sessionGitDirs ? { sessionGitDirs: opts.sessionGitDirs } : {}),
         ...(srtShim ? { srtShim: { runtimeRoot: srtShim.runtimeRoot } } : {}),
         runtimeId: runtimeEntry?.aliasOf ?? agent.runtime,
@@ -10858,9 +10879,17 @@ export class Daemon {
       // A hook's stored selection names the runtime even after its host stops.
       storedSessionExecution: async (agentId, acpSessionId) => {
         const rec = await this.store.getSessionByAcpIdForAgent(agentId, acpSessionId)
+        const pending = rec
+          ? this.pending.get(pendingTurnKey(this.sessionOwnerKey(agentId, rec.key), acpSessionId))
+          : undefined
         return {
           host: rec ? this.hostForOwner(this.sessionOwnerKey(agentId, rec.key)) : this.hosts.get(agentHostKey(agentId)),
-          target: pinnedDecisionTarget(rec?.decisionModel)
+          target: pinnedDecisionTarget(rec?.decisionModel),
+          // During a turn, its initial selector snapshot must not override newer live model information.
+          observed:
+            rec && (!pending || pending.signals.runtimeReportedModel)
+              ? await this.store.getObservedTurn(rec.key)
+              : undefined
         }
       }
     }
@@ -13990,6 +14019,7 @@ export class Daemon {
       this.emitTurnStarted(run, host, sessionId, created, prompt.finalCaptureInput, turnModel)
       const outcome = await this.runPromptLoop(p, run, { ...prompt, host, sessionId, turnModel, settlement })
       if (outcome.kind === 'cancelled') return null
+      if (!p.signals.runtimeReportedModel) turnModel = await this.captureTurnModel(run, host, sessionId, modelOverride)
       await this.settleUsage(p, run, sessionId)
       await this.commitWebchatReply(p, run, outcome)
       await this.flushPlatformFinals(p, run, sessionId, currentAttributionInfo)
@@ -15149,18 +15179,8 @@ export class Daemon {
     if (selectedModel && this.modelSessions.crossesHostProvider(key, agentId, selectedModel)) {
       // A live host can only use the provider credentials it started with.
       this.log.debug('model selection deferred — host is bound to its start-time provider')
-    } else if (selectedModel) {
-      const applied =
-        host.modelOptions?.(sessionId)?.current === selectedModel ||
-        (await host.setSessionModel(sessionId, selectedModel).catch(() => false))
-      if (
-        !applied &&
-        !override &&
-        runtimeAgent?.runtimeOverrides?.model &&
-        !this.modelSessions.crossesHostProvider(key, agentId, runtimeAgent.runtimeOverrides.model)
-      ) {
-        await host.setSessionModel(sessionId, runtimeAgent.runtimeOverrides.model).catch(() => false)
-      }
+    } else if (selectedModel && host.modelOptions?.(sessionId)?.current !== selectedModel) {
+      await host.setSessionModel(sessionId, selectedModel)
     }
     // Apply effort after the model, which determines the offered levels.
     const effortOverride =
@@ -16261,8 +16281,7 @@ export class Daemon {
     )
   }
 
-  /** This turn's live attribution facts. Re-read per call: a runtime may only publish its final
-   *  session-scoped model during the prompt. */
+  /** Prefer execution evidence, then the live selector, which can change during the prompt. */
   private async turnAttributionInfo(
     p: Pending,
     run: TurnRun,
@@ -16274,7 +16293,7 @@ export class Daemon {
       botName: agent.name,
       botUrl: this.agentLink(entry.agentId),
       runtime: this.runtimeFacts.runtimeNames()[agent.runtime] ?? agent.runtime,
-      model: (await this.buildStatusInfo(p)).model ?? turnModel ?? 'default',
+      model: p.signals.runtimeReportedModel ?? (await this.buildStatusInfo(p)).model ?? turnModel ?? 'default',
       sessionUrl: this.sessionLink(p.outwardSessionId, this.sessionLinkSource(plan.platform, plan.integrationId)),
       ...(plan.hopLimitNotice ? { notice: plan.hopLimitNotice } : {})
     }
@@ -18130,6 +18149,31 @@ export class Daemon {
     return maskSecretsDeep(payload, maskableSecrets(this.agents.get(agentId)))
   }
 
+  /** Keep native usage and the runtime's concrete model together, including notifications after turn completion. */
+  private async recordRuntimeUsageSnapshot(
+    key: string,
+    update: Extract<SessionUpdate, { sessionUpdate: 'usage_update' }>
+  ): Promise<string | undefined> {
+    await this.store.setUsageSnapshot(key, {
+      contextUsed: update.used,
+      contextSize: update.size,
+      costAmount: update.cost?.amount ?? undefined,
+      costCurrency: update.cost?.currency ?? undefined
+    })
+    // Claude ACP reports the top-level assistant model here even while its selector stays on "default".
+    const reported = update._meta?.['_claude/model']
+    const model = typeof reported === 'string' ? reported.trim() : ''
+    if (!model || model === 'default' || model === '<synthetic>') return
+    const observed = await this.store.getObservedTurn(key)
+    if (!observed?.runtime) return
+    if (observed.model !== model) {
+      await this.store.setObservedTurn(key, observed.runtime, model)
+      const rec = await this.store.getSession(key)
+      if (rec) await this.reportSessionStatus(rec)
+    }
+    return model
+  }
+
   /** Emit the daemon's latest merged usage snapshot. Used both at normal turn end
    *  and when a late ACP usage_update corrects an already-reported fallback. */
   private async emitStoredUsageReport(
@@ -18356,12 +18400,7 @@ export class Daemon {
       // platform delivery and evaluation telemetry.
       if (update?.sessionUpdate === 'usage_update' && extraction.sessionKey) {
         if (update.cost?.amount !== undefined) extraction.runtimeCostReported = true
-        await this.store.setUsageSnapshot(extraction.sessionKey, {
-          contextUsed: update.used,
-          contextSize: update.size,
-          costAmount: update.cost?.amount ?? undefined,
-          costCurrency: update.cost?.currency ?? undefined
-        })
+        await this.recordRuntimeUsageSnapshot(extraction.sessionKey, update)
       }
       return
     }
@@ -18374,12 +18413,7 @@ export class Daemon {
       if (extractionQuarantineOwner === agentId && update?.sessionUpdate === 'usage_update') {
         const rec = await this.sessionForAcp(owner, sessionId)
         if (rec?.platform === 'dream') {
-          await this.store.setUsageSnapshot(rec.key, {
-            contextUsed: update.used,
-            contextSize: update.size,
-            costAmount: update.cost?.amount ?? undefined,
-            costCurrency: update.cost?.currency ?? undefined
-          })
+          await this.recordRuntimeUsageSnapshot(rec.key, update)
           await this.emitStoredUsageReport(sessionId, agentId, rec.platform, rec.channel, rec.key, true)
         }
       }
@@ -18468,12 +18502,8 @@ export class Daemon {
       const key = p?.plan.sessionKey ?? rec?.key
       if (key) {
         if (p && update.cost?.amount !== undefined) p.signals.runtimeCostReported = true
-        await this.store.setUsageSnapshot(key, {
-          contextUsed: update.used,
-          contextSize: update.size,
-          costAmount: update.cost?.amount ?? undefined,
-          costCurrency: update.cost?.currency ?? undefined
-        })
+        const reportedModel = await this.recordRuntimeUsageSnapshot(key, update)
+        if (p && reportedModel) p.signals.runtimeReportedModel = reportedModel
         if (p) {
           // Live context/cost changed — refresh the status bar (deduped if nothing observable
           // moved). Token totals aren't in this stream; they fold in at turn end.
@@ -22966,6 +22996,7 @@ export class Daemon {
       ownStrategies: () => this.strategyTable(),
       // Only for the Control Plane's one-time `runInSandbox` migration: the retiring key, or its old default.
       sandboxBackend: () => this.cfg.sandbox.backend ?? 'srt',
+      contentStore: () => this.dataPlane?.storeId,
       executorFacet: () => this.executorFacet,
       admittedRuntimeIds: () => this.admittedRuntimeIds(),
       reportedRuntimeIds: () => this.reportedRuntimeIds(),

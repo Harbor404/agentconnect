@@ -89,7 +89,6 @@ export const canonicalColumns = [
   'isIm',
   'isQueueCmd',
   'lastDeliveredTs',
-  'lastReadAt',
   'lastRunAt',
   'lastTurnOutcome',
   'launchCorrelationId',
@@ -148,14 +147,11 @@ export const canonicalColumns = [
   'queuedAt',
   'quoteJson',
   'reasonCode',
-  'repositoryUrlHash',
   'replyTarget',
   'reportClaimedAt',
   'reportOwnerId',
   'requesterId',
   'requesterName',
-  'refHash',
-  'referenced',
   'recoveryAt',
   'replayKey',
   'resolvedAt',
@@ -196,7 +192,6 @@ export const canonicalColumns = [
   'trippedAt',
   'turnId',
   'updatedAt',
-  'usedBytes',
   'windowStartedAt',
   'workspaceIncarnation',
   'workspaceIsolation',
@@ -221,7 +216,15 @@ export const canonicalColumns = [
   'finishedAt',
   'bodiesStrippedAt',
   'messageId',
-  'releasedSeq'
+  'releasedSeq',
+  'repoClass',
+  'repoId',
+  'refHash',
+  'lastReadAt',
+  'unpointedAt',
+  'targetKey',
+  'committedBytes',
+  'pendingBytes'
 ] as const
 
 /** Lower-cased column name → the camelCase spelling every row shape expects back. */
