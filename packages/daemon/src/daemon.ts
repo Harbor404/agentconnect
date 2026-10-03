@@ -633,6 +633,7 @@ import {
 } from './runtimes/read-roots.js'
 import { nodeExecArgvModuleEntries } from './runtimes/node-exec-argv.js'
 import { makeLogger, type Logger } from './log.js'
+import { createSourceCache, type SourceCache, type SourceCachePresigner } from './source-cache/index.js'
 import { CpClient } from './cp/client.js'
 import { RelayManager } from './cp/relay-manager.js'
 import { CP_IDENTITY_TOKEN_PATH, readClusterIdentityToken } from './cp/cluster-identity.js'
@@ -698,8 +699,6 @@ import { managedDistillCapture, withManagedDistill } from './memory/managed-dist
 import { defaultMemoryPluginMetrics } from './memory-plugin/metrics.js'
 import { openPostgresDataPlane, type PostgresDataPlane } from './store/postgres-data-plane.js'
 import { DATA_PLANE_CONFIG_PATH } from './store/postgres-config.js'
-import { readSourceCacheConfig } from './source-cache/config.js'
-import { createSourceCacheSigner, type SourceCacheSigner } from './source-cache/signer.js'
 import type { EvaluationCapabilityProfile } from './evaluation/events.js'
 import { DaemonEvaluationHooks, type DaemonEvaluationHost } from './evaluation/daemon-hooks.js'
 import { SessionMetadataOutbox, type SessionMetadataHost } from './store/session-metadata-outbox.js'
@@ -1580,13 +1579,13 @@ export class Daemon {
   private readonly codexSessionFloor?: string
   private readonly claudeModelAliases?: Record<string, string>
   private readonly runtimeEnvironment: RuntimeEnvironment
+  /** The pool member's Source Cache signer; undefined outside --k8s or when no bucket is configured. */
+  private readonly sourceCache?: SourceCache
   /** Reads this pod's projected CP-audience token; undefined unless the daemon runs
    *  in-cluster AND the volume is actually mounted (decided once, at boot). */
   private readonly clusterIdentityToken?: () => string | undefined
   // The k8s execution plane: shim dialer + driver + workspace seam. Undefined outside --k8s.
   private k8sPlane?: K8sRuntimePlane
-  // The pool-member Source Cache signer. Undefined is the off/no-op state; only --k8s composes it.
-  private sourceCache?: SourceCacheSigner
   // An undefined entry awaits retry; a promise is the one takeover already in flight.
   private readonly k8sAdoptions = new Map<string, Promise<void> | undefined>()
   private microsandbox?: MicrosandboxManager
@@ -1856,8 +1855,6 @@ export class Daemon {
       startK8sPlane?: typeof startK8sRuntimePlane
       /** Test seam only; production reads the fixed Secret mount under `--k8s`, else the `postgres` store's file. */
       openDataPlane?: typeof openPostgresDataPlane
-      /** Test seam only; production reads the fixed member-only Source Cache mount under `--k8s`. */
-      readSourceCacheConfig?: typeof readSourceCacheConfig
       /** Test seam for the pool member startup barrier; production waits for CP register/ok. */
       startControlPlane?: (root: string) => Promise<void> | undefined
       /** Test seams for local catalog resolution and executable/state filtering. */
@@ -1887,6 +1884,8 @@ export class Daemon {
       keyServerClient?: KeyServerClient
       /** Test seam for the daemon-private memory-plugin transport. */
       memoryPluginConnect?: MemoryPluginConnector
+      /** Test seam for the Source Cache's STS calls. */
+      sourceCacheFetch?: typeof fetch
       /** Optional, observer-only evaluation surface and add-on treatment. */
       evaluation?: DaemonEvaluationOptions
     } = {}
@@ -1918,6 +1917,12 @@ export class Daemon {
     // supplies the key alone.
     this.modelSessions.staticModelCredentials = this.k8s ? configuredModelCredentials(process.env) : undefined
     this.runtimeEnvironment = this.k8s ? configuredRuntimeEnvironment(process.env) : {}
+    this.sourceCache = createSourceCache({
+      env: process.env,
+      k8s: this.k8s,
+      ...(opts.sourceCacheFetch ? { fetch: opts.sourceCacheFetch } : {}),
+      log: { info: (m) => this.log.info(m), warn: (m) => this.log.warn(m) }
+    })
     this.decisionEvaluator = new DecisionEvaluator({
       orgForAgent: (agentId) => this.orgForAgent(agentId),
       credentials: (request, signal) => {
@@ -2708,12 +2713,6 @@ export class Daemon {
 
   /** Phase 4 — the shared data plane (under --k8s, or a `postgres` store), then under --k8s the execution plane the workspaces resolve through. */
   private async startClusterPlanes(root: string, cfg: Config): Promise<void> {
-    // Source Cache is a pool-member capability. Composing it here keeps the shared Config loader and
-    // every non-k8s command unaware of both the document and any static credentials it resolves.
-    if (this.k8s) {
-      this.sourceCache = createSourceCacheSigner((this.opts.readSourceCacheConfig ?? readSourceCacheConfig)())
-      if (this.sourceCache) this.log.info('source cache: enabled')
-    }
     // `--k8s` needs the pool's shared store whatever the file says; any other daemon opens one only when its owner asked (#2188).
     const dataPlaneConfig = this.k8s
       ? DATA_PLANE_CONFIG_PATH
@@ -2993,6 +2992,11 @@ export class Daemon {
       log: { info: (m) => this.log.info(m), warn: (m) => this.log.warn(m) }
     })
     probeGitVersion((m) => this.log.warn(m))
+  }
+
+  /** The Source Cache presigner later clone and write-back paths consume; undefined when not configured. */
+  sourceCacheSigner(): SourceCachePresigner | undefined {
+    return this.sourceCache?.presigner
   }
 
   /** Phase 6 — settle this daemon id (minted locally only when the CP will not assign one) and rebuild the logger at the configured level. */
@@ -6715,6 +6719,9 @@ export class Daemon {
     const remoteHome = remoteSession && this.executorPlane?.homeFor(remoteSession.subject)
     // The roots its `prepare` named, where the session gitconfig and config files land in that machine's environment (§5).
     const remoteRoots = remoteSession && this.executorPlane?.rootsFor(remoteSession.sessionKey)
+    // Its `.codex` as that machine classified it, which this one cannot list (prepareExecutorLaunch).
+    const remoteCodexState =
+      remoteSession && remoteHome ? this.executorPlane?.codexStateFor(remoteSession.subject, remoteHome) : undefined
     if (remoteSession && (!remoteHome || !remoteRoots)) {
       throw new Error(
         `session ${remoteSession.leaf} has no environment on daemon ${remoteSession.executorDaemonId} to launch in — its next turn prepares one`
@@ -6868,7 +6875,9 @@ export class Daemon {
               }
             }
           : {}),
-        ...(remoteHome ? { executor: { home: remoteHome } } : {}),
+        ...(remoteHome
+          ? { executor: { home: remoteHome, ...(remoteCodexState ? { codexState: remoteCodexState } : {}) } }
+          : {}),
         ...(opts.sessionGitDirs ? { sessionGitDirs: opts.sessionGitDirs } : {}),
         ...(srtShim ? { srtShim: { runtimeRoot: srtShim.runtimeRoot } } : {}),
         runtimeId: runtimeEntry?.aliasOf ?? agent.runtime,
@@ -22987,6 +22996,7 @@ export class Daemon {
       ownStrategies: () => this.strategyTable(),
       // Only for the Control Plane's one-time `runInSandbox` migration: the retiring key, or its old default.
       sandboxBackend: () => this.cfg.sandbox.backend ?? 'srt',
+      contentStore: () => this.dataPlane?.storeId,
       executorFacet: () => this.executorFacet,
       admittedRuntimeIds: () => this.admittedRuntimeIds(),
       reportedRuntimeIds: () => this.reportedRuntimeIds(),

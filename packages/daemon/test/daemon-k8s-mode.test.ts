@@ -19,7 +19,6 @@ import { DEFAULT_SHIM_WORKSPACE_ROOT } from '../src/shim/protocol.js'
 import type { ResolvedRuntimeCatalog } from '../src/runtimes/registry.js'
 import { LocalStore } from '../src/store/local-store.js'
 import { DATA_PLANE_CONFIG_PATH } from '../src/store/postgres-config.js'
-import { SourceCacheConfigSchema, type readSourceCacheConfig } from '../src/source-cache/config.js'
 import { mcpSocketPath, statePath } from '../src/paths.js'
 import { SANDBOX_TUNNEL_PATHS } from '../src/shim/sandbox-paths.js'
 
@@ -101,10 +100,11 @@ function daemon(opts: {
   /** A store shared by several members, so a pool-wide probe can be asserted across them. */
   store?: LocalStore
   openDataPlane?: ReturnType<typeof vi.fn>
-  readSourceCacheConfig?: typeof readSourceCacheConfig
   startControlPlane?: ReturnType<typeof vi.fn>
   /** Receives the options the mode hands the plane — the rows about what it asks the pod to serve. */
   onPlaneStart?: (options: any) => void
+  /** The Source Cache's STS seam, so a row can prove no network call was made. */
+  sourceCacheFetch?: ReturnType<typeof vi.fn>
 }): Daemon {
   return new Daemon({
     root: opts.root,
@@ -135,12 +135,12 @@ function daemon(opts: {
         }
       : {}),
     ...(opts.openDataPlane ? { openDataPlane: opts.openDataPlane as never } : {}),
-    ...(opts.readSourceCacheConfig ? { readSourceCacheConfig: opts.readSourceCacheConfig as never } : {}),
     startControlPlane: (opts.startControlPlane ?? vi.fn(() => Promise.resolve())) as never,
     ...(opts.supervisor ? { supervisor: opts.supervisor } : {}),
     resolveCatalog: async () => catalog(),
     ...(opts.probe ? { probeRuntimes: opts.probe as never } : {}),
     ...(opts.probeHostFactory ? { probeHostFactory: opts.probeHostFactory as never } : {}),
+    ...(opts.sourceCacheFetch ? { sourceCacheFetch: opts.sourceCacheFetch as never } : {}),
     hostFactory: () => ({}) as never
   })
 }
@@ -281,33 +281,6 @@ describe('daemon --k8s mode', () => {
       expect(openDataPlane).not.toHaveBeenCalled()
     } finally {
       await local.stop()
-    }
-  })
-
-  it('loads the source-cache document only on a k8s pool member', async () => {
-    const sourceCache = SourceCacheConfigSchema.parse({
-      endpoint: 'https://cache.example.test',
-      region: 'us-east-1',
-      bucket: 'agentconnect-cache',
-      credentials: { source: 'serviceAccount' },
-      limits: {}
-    })
-    const readSourceCacheConfig = vi.fn(() => sourceCache)
-
-    const cfg = { store: { backend: 'local' }, limits: { poolShutdownDrainMs: 1 } } as never
-
-    const local = daemon({ root: root(), k8s: false, readSourceCacheConfig })
-    await (local as any).startClusterPlanes(root(), cfg)
-    expect(readSourceCacheConfig).not.toHaveBeenCalled()
-    expect((local as any).sourceCache).toBeUndefined()
-
-    const member = daemon({ root: root(), k8s: true, readSourceCacheConfig })
-    try {
-      await (member as any).startClusterPlanes(root(), cfg)
-      expect(readSourceCacheConfig).toHaveBeenCalledTimes(1)
-      expect((member as any).sourceCache).toBeDefined()
-    } finally {
-      await (member as any).dataPlane?.close()
     }
   })
 
@@ -2513,3 +2486,67 @@ async function openSessionClaim(
   await inner.openSession(run, () => {})
   return claimed
 }
+
+describe('daemon --k8s mode: Source Cache signer (source-cache.md §12)', () => {
+  function sourceCacheEnv(dir: string): string {
+    return JSON.stringify({
+      version: 1,
+      region: 'us-east-1',
+      bucket: 'ac-cache',
+      credentials: { source: 'static', dir, accessKeyIdKey: 'id', secretAccessKeyKey: 'secret' }
+    })
+  }
+
+  function keyDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'ac-source-cache-keys-'))
+    writeFileSync(join(dir, 'id'), 'AKIDEXAMPLE\n')
+    writeFileSync(join(dir, 'secret'), 'secret\n')
+    return dir
+  }
+
+  it('builds no signer and touches no network when the bucket is not configured', () => {
+    const fetch = vi.fn()
+    vi.stubEnv('AC_SOURCE_CACHE', '')
+    try {
+      const instance = daemon({ root: root(), k8s: true, sourceCacheFetch: fetch })
+      expect(instance.sourceCacheSigner()).toBeUndefined()
+      expect(fetch).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('refuses to construct with an invalid configuration, naming the variable', () => {
+    vi.stubEnv('AC_SOURCE_CACHE', JSON.stringify({ version: 1, region: 'us-east-1', bucket: 'ac-cache' }))
+    try {
+      expect(() => daemon({ root: root(), k8s: true })).toThrow('AC_SOURCE_CACHE is invalid')
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  // The document requires an absolute POSIX key directory, which a Windows temp dir is not.
+  it.skipIf(process.platform === 'win32')(
+    'builds a signer from a valid configuration without any network call',
+    async () => {
+      const fetch = vi.fn()
+      vi.stubEnv('AC_SOURCE_CACHE', sourceCacheEnv(keyDir()))
+      try {
+        const signer = daemon({ root: root(), k8s: true, sourceCacheFetch: fetch }).sourceCacheSigner()
+        expect(signer).toBeDefined()
+        expect(fetch).not.toHaveBeenCalled()
+      } finally {
+        vi.unstubAllEnvs()
+      }
+    }
+  )
+
+  it('ignores the configuration outside --k8s', () => {
+    vi.stubEnv('AC_SOURCE_CACHE', sourceCacheEnv(keyDir()))
+    try {
+      expect(daemon({ root: root(), k8s: false }).sourceCacheSigner()).toBeUndefined()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+})

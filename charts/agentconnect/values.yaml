@@ -409,42 +409,6 @@ daemonPool:
     nodeSelector: {}
     tolerations: []
 
-# Optional Source Cache. Empty endpoint or bucket leaves it OFF: no URLs are issued and
-# pool members clone from origin exactly as before. Only the daemon-pool member receives the
-# mounted document; sandbox pods and the reconciler receive neither the document nor credentials.
-sourceCache:
-  # Full S3 API origin, e.g. https://s3.us-east-1.amazonaws.com or https://minio.example.test
-  endpoint: ''
-  # SigV4 region. serviceAccount requires a concrete AWS region. Use "auto" only with secret
-  # credentials for a non-AWS S3-compatible store such as R2.
-  region: us-east-1
-  # Bucket (or bucket prefix) dedicated to this install's Source Cache.
-  bucket: ''
-  # Optional key prefix inside the bucket. The daemon adds src/, files/, and snapshots/ below it.
-  prefix: ''
-  # MinIO and other S3-compatible stores commonly require path-style addressing.
-  forcePathStyle: false
-  # serviceAccount resolves AWS identities only: the AWS access/secret environment pair,
-  # IRSA/web identity, or the ECS/EKS Pod Identity container endpoint. GKE Workload Identity,
-  # R2, MinIO, and other non-AWS stores require secret credentials.
-  # secret mounts an existing Kubernetes Secret as member-local files; credential values are
-  # never rendered into this values file, the Source Cache document, or process environment.
-  credentialSource: serviceAccount
-  existingSecret: ''
-  accessKeyIdKey: AWS_ACCESS_KEY_ID
-  secretAccessKeyKey: AWS_SECRET_ACCESS_KEY
-  # Optional session-token file. Empty is the normal two-key access/secret setup; set it only
-  # when the referenced Secret actually carries a session token.
-  sessionTokenKey: ''
-  # Section 10 limits. The daemon validates the values; the data plane enforces them.
-  limits:
-    maxBundleBytes: 2147483648 # 2 GiB
-    orgTotalBytes: 21474836480 # 20 GiB
-    pendingReservationMs: 3600000 # 1 h
-    pendingObjectTtlDays: 2
-    unreferencedObjectTtlDays: 7
-    unreadPointerTtlDays: 30
-
 controlPlane:
   image: control-plane
   # Per-component tag override; empty ⇒ the shared image.tag. Set it to the
@@ -837,6 +801,42 @@ objectStore:
   publicBaseUrl: ''
   # SigV4 region — "auto" for R2; a concrete region for real S3 / MinIO.
   region: auto
+
+# Source Cache (docs/designs/source-cache.md, chart README): rendered into daemon-pool members only; pods get presigned URLs alone.
+sourceCache:
+  enabled: false
+  # S3 API origin; must be https:// (the shim admits only https bundle URLs). Empty => AWS regional S3.
+  endpoint: ''
+  region: ''
+  bucket: ''
+  # Optional key prefix inside the bucket; must not start with snapshots/.
+  prefix: ''
+  # Path-style addressing (MinIO and most self-hosted stores). Dotted buckets and IP endpoints use it anyway.
+  forcePathStyle: false
+  credentials:
+    # serviceAccount (STS web identity, e.g. IRSA) or secret (static keys mounted as files).
+    source: serviceAccount
+    serviceAccount:
+      # Set => a token for this role is projected onto members only; empty => webhook-injected AWS_ROLE_ARN/AWS_WEB_IDENTITY_TOKEN_FILE.
+      roleArn: ''
+      audience: sts.amazonaws.com
+      # Empty => https://sts.<region>.amazonaws.com.
+      stsEndpoint: ''
+    secret:
+      # Existing Secret in the release namespace, mounted read-only into members.
+      name: ''
+      accessKeyIdKey: AWS_ACCESS_KEY_ID
+      secretAccessKeyKey: AWS_SECRET_ACCESS_KEY
+      # Optional key holding a session token for temporary keys.
+      sessionTokenKey: ''
+  # Section 10 limits plus the presigned URL lifetimes.
+  limits:
+    maxBundleBytes: 2Gi
+    orgQuotaBytes: 20Gi
+    pendingReservation: 1h
+    unreadPointerDays: 30
+    getUrlLifetime: 5m
+    putUrlLifetime: 15m
 
 # Bootstrap/runtime roots are read from an existing Secret you create in the
 # namespace (the chart never holds their values). Provider credentials are not

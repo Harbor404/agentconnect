@@ -610,144 +610,110 @@ default_member = find.call('Deployment', 'example-agentconnect-daemon-pool')
                      .dig('spec', 'template', 'spec', 'containers', 0).fetch('env').map { |item| item.fetch('name') }
 abort('an unset grace must leave both sides on the daemon default') if default_member.include?('AC_K8S_ORPHAN_GRACE_MS')
 
-# Source Cache is a daemon-pool member capability only. The member reads a fixed document from
-# a ConfigMap; static credentials are Secret files, never environment variables or Config arms.
-source_cache_name = 'example-agentconnect-source-cache'
-default_documents = documents
-abort('source Cache must be off by default') if default_documents.any? do |doc|
-  doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == source_cache_name
+# ── Source Cache (source-cache.md §12): off by default, member-only, credentials never in a pod ──
+pool_member = lambda do |docs|
+  deployment = docs.find { |doc| doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool' } ||
+               abort('missing daemon-pool Deployment')
+  pod_spec = deployment.dig('spec', 'template', 'spec')
+  [pod_spec, pod_spec.fetch('containers').find { |item| item['name'] == 'daemon-pool' }]
 end
-abort('source Cache must be off by default') if container.fetch('env').any? { |item| item.fetch('name').start_with?('AC_SOURCE_CACHE_') }
+source_cache_free = lambda do |label, pod_spec, containers|
+  abort("#{label} must carry no Source Cache volume") if pod_spec.fetch('volumes', []).any? { |v| v['name'].start_with?('source-cache') }
+  containers.each do |c|
+    names = c.fetch('env', []).map { |item| item.fetch('name') }
+    abort("#{label} must carry no AC_SOURCE_CACHE") if names.include?('AC_SOURCE_CACHE')
+    abort("#{label} must carry no AWS_* credentials") if names.any? { |name| name.start_with?('AWS_') }
+    abort("#{label} must mount no Source Cache volume") if c.fetch('volumeMounts', []).any? { |m| m['name'].start_with?('source-cache') }
+  end
+end
+[['base', documents], ['pure defaults', defaults_documents]].each do |label, docs|
+  pod_spec, member = pool_member.call(docs)
+  source_cache_free.call("the #{label} member", pod_spec, [member])
+end
 
-source_cache_set = [
-  '--set', 'sourceCache.endpoint=https://cache.example.test',
-  '--set', 'sourceCache.region=auto',
-  '--set', 'sourceCache.bucket=agentconnect-cache',
-  '--set', 'sourceCache.prefix=install-a',
+source_cache_base = command + [
+  '--set', 'sourceCache.enabled=true',
+  '--set', 'sourceCache.endpoint=https://minio.example.test',
+  '--set', 'sourceCache.region=us-east-1',
+  '--set', 'sourceCache.bucket=ac-cache',
+  '--set', 'sourceCache.prefix=agentconnect'
+]
+secret_rendered, secret_error, secret_status = Open3.capture3(
+  *source_cache_base,
   '--set', 'sourceCache.forcePathStyle=true',
-  '--set', 'sourceCache.credentialSource=secret',
-  '--set', 'sourceCache.existingSecret=source-cache-credentials',
-  '--set-json', 'sourceCache.limits={"maxBundleBytes":3000,"orgTotalBytes":30000,"pendingReservationMs":7200000,"pendingObjectTtlDays":3,"unreferencedObjectTtlDays":8,"unreadPointerTtlDays":31}'
-]
-source_rendered, source_error, source_status = Open3.capture3(*(command + source_cache_set))
-abort("helm template (source cache enabled) failed:\n#{source_error}") unless source_status.success?
-source_documents = YAML.load_stream(source_rendered).compact
-source_config_map = source_documents.find do |doc|
-  doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == source_cache_name
-end || abort('daemon pool must receive the source-cache ConfigMap')
-source_config = JSON.parse(source_config_map.dig('data', 'config.json'))
-abort('source-cache config must carry version 1') unless source_config['version'] == 1
-abort('source-cache config must carry the endpoint') unless source_config['endpoint'] == 'https://cache.example.test'
-abort('source-cache config must carry the region') unless source_config['region'] == 'auto'
-abort('source-cache config must carry the bucket') unless source_config['bucket'] == 'agentconnect-cache'
-abort('source-cache config must carry the prefix') unless source_config['prefix'] == 'install-a'
-abort('source-cache config must carry forcePathStyle') unless source_config['forcePathStyle'] == true
-abort('source-cache config must name the credential source') unless source_config.dig('credentials', 'source') == 'secret'
-abort('source-cache Secret credentials must identify member-local key files') unless
-  source_config['credentials'] == {
-    'source' => 'secret',
-    'accessKeyIdFile' => '/var/run/ac-source-cache-credentials/access-key-id',
-    'secretAccessKeyFile' => '/var/run/ac-source-cache-credentials/secret-access-key'
+  '--set', 'sourceCache.credentials.source=secret',
+  '--set', 'sourceCache.credentials.secret.name=example-source-cache'
+)
+abort("helm template (Source Cache secret) failed:\n#{secret_error}") unless secret_status.success?
+secret_documents = YAML.load_stream(secret_rendered).compact
+secret_pod, secret_member = pool_member.call(secret_documents)
+secret_env = secret_member.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+source_cache_doc = JSON.parse(secret_env['AC_SOURCE_CACHE'] || abort('an enabled Source Cache must reach the member'))
+abort("unexpected Source Cache document: #{source_cache_doc}") unless source_cache_doc == {
+  'version' => 1, 'endpoint' => 'https://minio.example.test', 'region' => 'us-east-1', 'bucket' => 'ac-cache',
+  'prefix' => 'agentconnect', 'forcePathStyle' => true,
+  'credentials' => {
+    'source' => 'static', 'dir' => '/var/run/ac-source-cache',
+    'accessKeyIdKey' => 'AWS_ACCESS_KEY_ID', 'secretAccessKeyKey' => 'AWS_SECRET_ACCESS_KEY'
+  },
+  'limits' => {
+    'maxBundleBytes' => '2Gi', 'orgQuotaBytes' => '20Gi', 'pendingReservationSeconds' => '1h',
+    'unreadPointerDays' => 30, 'getUrlSeconds' => '5m', 'putUrlSeconds' => '15m'
   }
-abort('source-cache config must carry section 10 limits') unless source_config['limits'] == {
-  'maxBundleBytes' => 3000,
-  'orgTotalBytes' => 30000,
-  'pendingReservationMs' => 7_200_000,
-  'pendingObjectTtlDays' => 3,
-  'unreferencedObjectTtlDays' => 8,
-  'unreadPointerTtlDays' => 31
 }
+secret_volume = secret_pod.fetch('volumes').find { |v| v['name'] == 'source-cache-credentials' } ||
+                abort('the secret source must mount its Secret')
+abort('the Source Cache Secret must be mounted whole at 0400') unless
+  secret_volume['secret'] == { 'secretName' => 'example-source-cache', 'defaultMode' => 0o400 }
+secret_mount = secret_member.fetch('volumeMounts').find { |m| m['name'] == 'source-cache-credentials' }
+abort('the Source Cache Secret must be mounted read-only') unless
+  secret_mount == { 'name' => 'source-cache-credentials', 'mountPath' => '/var/run/ac-source-cache', 'readOnly' => true }
+abort('static keys must arrive as files, never env') if secret_member.fetch('env').any? { |item|
+  item['name'].start_with?('AWS_') || item.dig('valueFrom', 'secretKeyRef', 'name') == 'example-source-cache'
+}
+abort('the secret source must not project a web identity') if secret_pod.fetch('volumes').any? { |v| v['name'] == 'source-cache-identity' }
+secret_template = secret_documents.find { |doc| doc['kind'] == 'SandboxTemplate' && doc.dig('metadata', 'name') == 'example-agentconnect-runtime' } ||
+                  abort('missing SandboxTemplate in the Source Cache render')
+template_pod = secret_template.dig('spec', 'podTemplate', 'spec')
+source_cache_free.call('the runtime SandboxTemplate', template_pod, template_pod.fetch('containers') + template_pod.fetch('initContainers', []))
+secret_reconciler = secret_documents.find { |doc| doc['kind'] == 'CronJob' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool-reconciler' } ||
+                    abort('missing reconciler CronJob in the Source Cache render')
+reconciler_pod = secret_reconciler.dig('spec', 'jobTemplate', 'spec', 'template', 'spec')
+source_cache_free.call('the reconciler', reconciler_pod, reconciler_pod.fetch('containers'))
 
-source_deployment = source_documents.find do |doc|
-  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
-end || abort('missing daemon-pool Deployment in the source-cache render')
-source_pod = source_deployment.dig('spec', 'template', 'spec')
-source_container = source_pod.fetch('containers').find { |item| item['name'] == 'daemon-pool' } ||
-                   abort('missing daemon-pool container in the source-cache render')
-abort('source-cache config must not travel through daemon environment') if
-  source_container.fetch('env').any? { |item| item.fetch('name').start_with?('AC_SOURCE_CACHE_') }
-source_mounts = source_container.fetch('volumeMounts').to_h { |item| [item.fetch('name'), item] }
-abort('daemon pool must mount the source-cache ConfigMap') unless
-  source_mounts.dig('source-cache', 'mountPath') == '/var/run/ac-source-cache'
-abort('daemon pool must mount the static credential Secret') unless
-  source_mounts.dig('source-cache-credentials', 'mountPath') == '/var/run/ac-source-cache-credentials'
-
-source_volumes = source_pod.fetch('volumes').to_h { |item| [item.fetch('name'), item] }
-abort('source-cache ConfigMap volume must name the rendered document') unless
-  source_volumes.dig('source-cache', 'configMap') == {
-    'defaultMode' => 256,
-    'items' => [{ 'key' => 'config.json', 'path' => 'config.json' }],
-    'name' => source_cache_name
-  }
-abort('source-cache Secret volume must be member-local') unless
-  source_volumes.dig('source-cache-credentials', 'secret', 'secretName') == 'source-cache-credentials'
-abort('two-key static credentials must not require a session-token key') unless
-  source_volumes.dig('source-cache-credentials', 'secret', 'items') == [
-    { 'key' => 'AWS_ACCESS_KEY_ID', 'path' => 'access-key-id' },
-    { 'key' => 'AWS_SECRET_ACCESS_KEY', 'path' => 'secret-access-key' }
-  ]
-
-source_config_bytes = source_config_map.dig('data', 'config.json')
-abort('source-cache ConfigMap must not inline static credentials') if
-  source_config_bytes.include?('AKIDEXAMPLE') || source_config_bytes.include?('secret-example')
-
-source_reconciler = source_documents.find do |doc|
-  doc['kind'] == 'CronJob' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool-reconciler'
-end || abort('missing daemon-pool reconciler')
-abort('the reconciler must not receive source-cache configuration') if source_reconciler.to_yaml.include?('source-cache')
-source_runtime = source_documents.find do |doc|
-  doc['kind'] == 'SandboxTemplate' && doc.dig('metadata', 'name') == 'example-agentconnect-runtime'
-end || abort('missing runtime SandboxTemplate')
-abort('sandbox pods must never receive source-cache configuration') if source_runtime.to_yaml.include?('source-cache')
-
-session_token_set = source_cache_set + ['--set', 'sourceCache.sessionTokenKey=AWS_SESSION_TOKEN']
-session_rendered, session_error, session_status = Open3.capture3(*(command + session_token_set))
-abort("helm template (source cache session token) failed:\n#{session_error}") unless session_status.success?
-session_documents = YAML.load_stream(session_rendered).compact
-session_deployment = session_documents.find do |doc|
-  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
-end || abort('missing daemon-pool Deployment in the session-token render')
-session_volumes = session_deployment.dig('spec', 'template', 'spec', 'volumes').to_h { |item| [item.fetch('name'), item] }
-abort('a configured session-token key must be projected as an optional-pair addition') unless
-  session_volumes.dig('source-cache-credentials', 'secret', 'items').include?(
-    { 'key' => 'AWS_SESSION_TOKEN', 'path' => 'session-token' }
-  )
-
-service_account_set = [
-  '--set', 'sourceCache.endpoint=https://cache.example.test',
-  '--set', 'sourceCache.bucket=agentconnect-cache',
-  '--set', 'sourceCache.credentialSource=serviceAccount'
-]
-service_rendered, service_error, service_status = Open3.capture3(*(command + service_account_set))
-abort("helm template (source cache service account) failed:\n#{service_error}") unless service_status.success?
-service_documents = YAML.load_stream(service_rendered).compact
-service_config_map = service_documents.find do |doc|
-  doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == source_cache_name
-end || abort('missing service-account source-cache ConfigMap')
-service_config = JSON.parse(service_config_map.dig('data', 'config.json'))
-abort('ServiceAccount source must be AWS identity resolution') unless
-  service_config.dig('credentials', 'source') == 'serviceAccount'
-abort('ServiceAccount source must default to a concrete AWS region') unless service_config['region'] == 'us-east-1'
-service_deployment = service_documents.find do |doc|
-  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
-end || abort('missing daemon-pool service-account Deployment')
-service_pod = service_deployment.dig('spec', 'template', 'spec')
-service_container = service_pod.fetch('containers').find { |item| item['name'] == 'daemon-pool' }
-service_mount_names = service_container.fetch('volumeMounts').map { |item| item.fetch('name') }
-abort('ServiceAccount source must not mount the static credential Secret') if
-  service_mount_names.include?('source-cache-credentials')
-service_env_names = service_container.fetch('env').map { |item| item.fetch('name') }
-abort('ServiceAccount source must not inject static-key environment') if service_env_names.any? { |name| name.start_with?('AC_SOURCE_CACHE_') }
+identity_rendered, identity_error, identity_status = Open3.capture3(
+  *source_cache_base,
+  '--set', 'sourceCache.credentials.serviceAccount.roleArn=arn:aws:iam::123456789012:role/ac-source-cache'
+)
+abort("helm template (Source Cache web identity) failed:\n#{identity_error}") unless identity_status.success?
+identity_pod, identity_member = pool_member.call(YAML.load_stream(identity_rendered).compact)
+identity_doc = JSON.parse(identity_member.fetch('env').find { |item| item['name'] == 'AC_SOURCE_CACHE' }&.fetch('value') ||
+                          abort('the web identity form must reach the member'))
+abort("unexpected web identity credentials: #{identity_doc['credentials']}") unless identity_doc['credentials'] == {
+  'source' => 'webIdentity', 'roleArn' => 'arn:aws:iam::123456789012:role/ac-source-cache',
+  'tokenFile' => '/var/run/ac-source-cache-identity/token'
+}
+identity_volume = identity_pod.fetch('volumes').find { |v| v['name'] == 'source-cache-identity' } ||
+                  abort('a roleArn must project the member web identity token')
+abort('the web identity token must carry the STS audience') unless identity_volume.dig('projected', 'sources') == [{
+  'serviceAccountToken' => { 'path' => 'token', 'audience' => 'sts.amazonaws.com', 'expirationSeconds' => 3600 }
+}]
+abort('the web identity token must be mounted read-only') unless identity_member.fetch('volumeMounts').any? { |m|
+  m == { 'name' => 'source-cache-identity', 'mountPath' => '/var/run/ac-source-cache-identity', 'readOnly' => true }
+}
+abort('the web identity form must mount no Secret') if identity_pod.fetch('volumes').any? { |v| v['name'] == 'source-cache-credentials' }
 
 [
-  [['sourceCache.endpoint=https://cache.example.test', 'sourceCache.bucket=agentconnect-cache', 'sourceCache.credentialSource=secret'], 'existingSecret'],
-  [['sourceCache.endpoint=https://cache.example.test'], 'bucket'],
-  [['sourceCache.endpoint=https://cache.example.test', 'sourceCache.bucket=agentconnect-cache', 'sourceCache.credentialSource=serviceAccount', 'sourceCache.region=auto'], 'concrete AWS region']
-].each do |settings, expected|
-  extra = settings.flat_map { |setting| ['--set', setting] }
-  _, refused, refused_status = Open3.capture3(*(command + extra))
-  abort("incomplete source cache #{settings.join(', ')} must be refused") if refused_status.success?
-  abort("refusal for #{settings.join(', ')} must say what is missing:\n#{refused}") unless refused.include?(expected)
+  [['--set', 'sourceCache.enabled=true', '--set', 'sourceCache.region=us-east-1'], 'sourceCache.bucket is required'],
+  [source_cache_base + ['--set', 'sourceCache.credentials.source=secret'], 'secret.name is required'],
+  [source_cache_base + ['--set', 'sourceCache.endpoint=http://minio.example.test'], 'https://'],
+  [source_cache_base + ['--set', 'sourceCache.credentials.source=static'], 'serviceAccount or secret'],
+  [source_cache_base + ['--set', 'daemonPool.extraEnv.AC_SOURCE_CACHE={}'], 'AC_SOURCE_CACHE collides']
+].each do |extra, expected|
+  args = extra.first == '--set' ? command + extra : extra
+  _, refused, refused_status = Open3.capture3(*args)
+  abort("Source Cache render must be refused (#{expected})") if refused_status.success?
+  abort("Source Cache refusal must say #{expected}:\n#{refused}") unless refused.include?(expected)
 end
 
 puts 'chart render contract: ok'
