@@ -30,6 +30,7 @@ import type { Logger } from '../log.js'
 import { ownCredentialEnv } from '../microsandbox/secrets.js'
 import { prepareSharedRuntimeCredentials } from '../runtimes/runtime-credentials.js'
 import { prepareRuntimeHome } from '../runtimes/runtime-home.js'
+import { CODEX_STATE_SECRETS, privateRuntimeState } from '../runtimes/private-runtime-state.js'
 import { workspaceIncarnationOf } from '../skills/workspace-incarnation.js'
 import { PIPE_KEY_BYTES, startPipeListener, type PipeListener, type PipeListenerOptions } from './executor-pipe.js'
 import { hostedEnvironment } from './executor-vm.js'
@@ -400,6 +401,9 @@ class Facet implements ExecutorFacet {
     // The skill ledger's key: this directory outlives the launch, so its next launch must find the receipts this one leaves.
     const workspaceIncarnation = await workspaceIncarnationOf(join(this.sessionsDir, env.leaf)).catch(() => undefined)
     if (env.generation !== generation || !env.shim || !this.listener) return refused('launch_retired')
+    // The holder cannot list this HOME nor the shared file its credential link points at: this machine classifies it.
+    const codexHome = join(this.sessionsDir, env.leaf, 'home')
+    const codexState = privateRuntimeState(join(codexHome, '.codex'), CODEX_STATE_SECRETS)
     env.key = randomBytes(PIPE_KEY_BYTES)
     env.reply = {
       status: 'ready',
@@ -410,6 +414,7 @@ class Facet implements ExecutorFacet {
       ...(env.shim.helperRoot === undefined ? {} : { helperRoot: env.shim.helperRoot }),
       ...(env.shim.missingHelpers.length > 0 ? { missingHelpers: env.shim.missingHelpers } : {}),
       ...(runtimeLaunch ? { runtimeLaunch } : {}),
+      ...(codexState.readOnly.length > 0 ? { codexState: { home: codexHome, ...codexState } } : {}),
       ...(workspaceIncarnation ? { workspaceIncarnation } : {}),
       liveCount: this.liveCount()
     }
