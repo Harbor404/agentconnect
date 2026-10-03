@@ -1,5 +1,4 @@
-import { lstatSync, realpathSync } from 'node:fs'
-import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, normalize, resolve } from 'node:path'
 
 // Share the daemon's workspace Git command inventory across sandbox transports.
 export const ALLOWED_GIT_SUBCOMMANDS = new Set([
@@ -14,6 +13,7 @@ export const ALLOWED_GIT_SUBCOMMANDS = new Set([
   'config',
   'diff',
   'fetch',
+  'fsck',
   'log',
   'ls-files',
   'ls-remote',
@@ -30,28 +30,19 @@ export const ALLOWED_GIT_SUBCOMMANDS = new Set([
   'worktree'
 ])
 
-// Refuse execution options in every accepted spelling.
+// Long options that reach execution or arbitrary reads; `--exec` is the hidden ls-remote/push alias of the pack programs.
 const REFUSED_LONG_OPTIONS = [
-  '--config', // --config=k=v
-  '--config-env',
-  '--exec-path', // relocates git's helper binaries
   '--upload-pack',
-  '--receive-pack'
+  '--receive-pack',
+  '--exec',
+  '--exec-path',
+  '--config',
+  '--config-env',
+  '--bundle-uri'
 ]
-const REFUSED_SHORT_ARGUMENT = /^-c/ // ad-hoc config in any spelling: -c k=v, -ck=v
 
-function optionPart(argument: string): string {
-  const equals = argument.indexOf('=')
-  return equals === -1 ? argument : argument.slice(0, equals)
-}
-
-function isRefusedArgument(argument: string): boolean {
-  if (REFUSED_SHORT_ARGUMENT.test(argument)) return true
-  const option = optionPart(argument)
-  return REFUSED_LONG_OPTIONS.some(
-    (refused) => option.length > 2 && (refused.startsWith(option) || option.startsWith(refused))
-  )
-}
+// Ad-hoc config in any short spelling: -c k=v, -ck=v.
+const REFUSED_SHORT_CONFIG = /^-c/
 
 // These spellings reach execution only for the named subcommand.
 const REFUSED_SUBCOMMAND_ARGUMENT: Record<string, RegExp[]> = {
@@ -73,6 +64,21 @@ const REFUSED_SUBCOMMAND_ARGUMENT: Record<string, RegExp[]> = {
   config: [/^-e$/, /^--edit/]
 }
 
+// Clone's short options: `u`/`c` execute anywhere in a group (`-qu<cmd>`), and a value-taking letter ends the group.
+const CLONE_REFUSED_SHORT = new Set(['u', 'c'])
+const CLONE_VALUE_SHORT = new Set(['o', 'b', 'j'])
+
+const BUNDLE_URI_PREFIX = '--bundle-uri=https://'
+const MAX_BUNDLE_URI_LENGTH = 8192
+const BUNDLE_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.bundle$/
+const BRANCH_REF_PREFIX = 'refs/heads/'
+const MAX_REF_LENGTH = 1024
+
+export interface GitPolicyContext {
+  // The shim's bundle staging directory; without one `bundle` is refused.
+  bundleStagingDir?: string
+}
+
 export class ExecRefusedError extends Error {
   constructor(message: string) {
     super(message)
@@ -80,199 +86,112 @@ export class ExecRefusedError extends Error {
   }
 }
 
-export interface GitCommandPolicyOptions {
-  /** The only directory in which a write-back bundle may be created. */
-  stagingRoot: string
+// Git runs any unique prefix of a long option as the full option, so a prefix of a refused name is refused too.
+function refusedLongOption(argument: string): string | undefined {
+  if (!argument.startsWith('--')) return undefined
+  const equals = argument.indexOf('=')
+  const name = equals === -1 ? argument : argument.slice(0, equals)
+  if (name.length <= 2) return undefined
+  return REFUSED_LONG_OPTIONS.find((refused) => refused.startsWith(name) || name.startsWith(refused))
 }
 
-const BUNDLE_URI = '--bundle-uri'
-const BUNDLE_FILTER = '--filter=blob:none'
-const MAX_BUNDLE_URI_LENGTH = 8 * 1024
-const MAX_REF_LENGTH = 1024
-const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/
-const SAFE_BUNDLE_PATH_SEGMENT = /^[A-Za-z0-9._-]+$/
-const SAFE_REF_COMPONENT = /^[\p{L}\p{N}._-]+$/u
-
-function refuse(message: string): never {
-  throw new ExecRefusedError(message)
-}
-
-function validateBundleUri(uri: string, subcommand: string): void {
-  if (subcommand !== 'clone') refuse(`${BUNDLE_URI} is only permitted for git clone`)
-  if (uri.length === 0 || uri.length > MAX_BUNDLE_URI_LENGTH || CONTROL_CHARACTER.test(uri) || /\s/.test(uri)) {
-    refuse(`${BUNDLE_URI} must be a bounded HTTPS URL`)
+function refusedCloneShortGroup(argument: string): boolean {
+  if (!argument.startsWith('-') || argument.startsWith('--')) return false
+  for (const letter of argument.slice(1)) {
+    if (CLONE_REFUSED_SHORT.has(letter)) return true
+    if (CLONE_VALUE_SHORT.has(letter)) return false
   }
-  if (!uri.startsWith('https://')) refuse(`${BUNDLE_URI} must use https://`)
+  return false
+}
+
+// Admit at most one `--bundle-uri=https://<host>/…` in exactly that spelling; returns its index or -1.
+function validateBundleUri(rest: string[]): number {
+  const occurrences = rest.flatMap((argument, index) => (refusedLongOption(argument) === '--bundle-uri' ? [index] : []))
+  if (occurrences.length === 0) return -1
+  if (occurrences.length > 1) throw new ExecRefusedError('--bundle-uri may be given at most once')
+  const index = occurrences[0]!
+  const argument = rest[index]!
+  if (!argument.startsWith(BUNDLE_URI_PREFIX)) {
+    throw new ExecRefusedError('--bundle-uri is admitted only as --bundle-uri=https://…')
+  }
+  const value = argument.slice('--bundle-uri='.length)
+  if (value.length > MAX_BUNDLE_URI_LENGTH) throw new ExecRefusedError('--bundle-uri value is too long')
+  if (!/^[\x21-\x7e]+$/.test(value) || value.includes('\\')) {
+    throw new ExecRefusedError('--bundle-uri value contains a forbidden character')
+  }
+  const authority = value.slice('https://'.length).split(/[/?#]/, 1)[0] ?? ''
+  if (authority === '' || authority.includes('@')) {
+    throw new ExecRefusedError('--bundle-uri must name a host and carry no userinfo')
+  }
   let url: URL
   try {
-    url = new URL(uri)
+    url = new URL(value)
   } catch {
-    refuse(`${BUNDLE_URI} is not a valid URL`)
+    throw new ExecRefusedError('--bundle-uri value is not a URL')
   }
-  if (
-    url.protocol !== 'https:' ||
-    url.hostname === '' ||
-    url.username !== '' ||
-    url.password !== '' ||
-    url.hash !== ''
-  ) {
-    refuse(`${BUNDLE_URI} must be a credential-free HTTPS URL without a fragment`)
+  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.hostname === '') {
+    throw new ExecRefusedError('--bundle-uri must be an https URL with a host and no userinfo')
   }
+  return index
 }
 
-function validateBundleUris(args: string[]): void {
-  const [subcommand, ...rest] = args
-  let seen = false
-  for (let index = 0; index < rest.length; index += 1) {
-    const argument = rest[index]!
-    if (argument === BUNDLE_URI) {
-      const value = rest[index + 1]
-      if (value === undefined) refuse(`${BUNDLE_URI} requires an HTTPS URL`)
-      validateBundleUri(value, subcommand ?? '')
-      seen = true
-      index += 1
-      continue
-    }
-    if (argument.startsWith(`${BUNDLE_URI}=`)) {
-      validateBundleUri(argument.slice(BUNDLE_URI.length + 1), subcommand ?? '')
-      seen = true
-      continue
-    }
-    const option = argument.includes('=') ? argument.slice(0, argument.indexOf('=')) : argument
-    // Git accepts unique long-option prefixes. `--bu=` reaches the same clone option as the full
-    // spelling, so accepting only the complete token would make the HTTPS rule bypassable.
-    if (option.length > 2 && BUNDLE_URI.startsWith(option)) {
-      refuse(`argument ${argument} is not an accepted bundle URI spelling`)
-    }
-    if (argument.startsWith(BUNDLE_URI)) refuse(`argument ${argument} is not an accepted bundle URI spelling`)
-  }
-  if (seen && subcommand !== 'clone') refuse(`${BUNDLE_URI} is only permitted for git clone`)
-  if (seen && rest.filter((argument) => argument === BUNDLE_URI || argument.startsWith(`${BUNDLE_URI}=`)).length > 1) {
-    refuse(`${BUNDLE_URI} may be supplied once`)
-  }
+// Git's ref-format rules (git check-ref-format), restricted to a full `refs/heads/*` name.
+export function isValidBranchRef(ref: string): boolean {
+  if (ref.length > MAX_REF_LENGTH || !ref.startsWith(BRANCH_REF_PREFIX)) return false
+  if (ref.length === BRANCH_REF_PREFIX.length || ref === '@') return false
+  if (/[\x00-\x20\x7f~^:?*[\\]/.test(ref)) return false
+  if (ref.includes('..') || ref.includes('@{') || ref.includes('//')) return false
+  if (ref.endsWith('/') || ref.endsWith('.')) return false
+  return ref.split('/').every((component) => !component.startsWith('.') && !component.endsWith('.lock'))
 }
 
-/** Resolve a possibly-not-yet-existing path without following a symlink out of the staging root. */
-function canonicalPotential(path: string): string {
-  const absolute = normalize(resolve(path))
-  const missing: string[] = []
-  let current = absolute
-  while (true) {
-    try {
-      lstatSync(current)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') refuse(`cannot inspect bundle path: ${path}`)
-      const parent = dirname(current)
-      if (parent === current) refuse(`cannot resolve bundle path: ${path}`)
-      missing.unshift(basename(current))
-      current = parent
-      continue
-    }
-    try {
-      const existing = realpathSync(current)
-      return missing.length === 0 ? existing : join(existing, ...missing)
-    } catch {
-      refuse(`bundle path contains a broken symlink: ${path}`)
-    }
+// Admit only `bundle create [-q] <file> [--filter=blob:none] refs/heads/<name>` with <file> a direct child of the staging dir.
+function validateBundleCreate(rest: string[], stagingDir: string | undefined): void {
+  if (!stagingDir) throw new ExecRefusedError('git bundle is refused: this shim has no bundle staging directory')
+  const [verb, ...operands] = rest
+  if (verb !== 'create') throw new ExecRefusedError(`git bundle ${verb ?? '(none)'} is refused`)
+  const quiet = operands[0] === '-q' ? 1 : 0
+  const tail = operands.slice(quiet)
+  const filtered = tail.length === 3 && tail[1] === '--filter=blob:none'
+  if (tail.length !== (filtered ? 3 : 2)) throw new ExecRefusedError('git bundle create has an unexpected shape')
+  const file = tail[0]!
+  const ref = tail[tail.length - 1]!
+  if (!isAbsolute(file) || normalize(file) !== file || dirname(file) !== resolve(stagingDir)) {
+    throw new ExecRefusedError(`bundle file must be directly inside the staging directory: ${file}`)
   }
+  if (!BUNDLE_FILE_NAME.test(basename(file))) throw new ExecRefusedError(`bundle file name is refused: ${file}`)
+  if (!isValidBranchRef(ref)) throw new ExecRefusedError(`bundle ref must be a full refs/heads/* name: ${ref}`)
 }
 
-function canonicalStagingRoot(stagingRoot: string): string {
-  const absolute = normalize(resolve(stagingRoot))
-  let stat
-  try {
-    stat = lstatSync(absolute)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') refuse('bundle staging root does not exist')
-    refuse(`cannot inspect bundle staging root: ${stagingRoot}`)
-  }
-  if (stat.isSymbolicLink() || !stat.isDirectory()) refuse('bundle staging root must be a real directory')
-  try {
-    return realpathSync(absolute)
-  } catch {
-    refuse(`cannot resolve bundle staging root: ${stagingRoot}`)
-  }
+// The <file> operand of an already-validated `bundle create`.
+export function bundleCreateFile(args: string[]): string {
+  const operands = args.slice(2)
+  return operands[0] === '-q' ? operands[1]! : operands[0]!
 }
 
-function validateBundleFile(stagingRoot: string | undefined, file: string): void {
-  if (!stagingRoot) refuse('bundle create requires a staging root')
-  if (!isAbsolute(file)) refuse('bundle output file must be absolute')
-  if (CONTROL_CHARACTER.test(file)) refuse('bundle output file contains a control character')
-  if (basename(file).length <= '.bundle'.length || !basename(file).endsWith('.bundle')) {
-    refuse('bundle output file must end in .bundle')
-  }
-  try {
-    lstatSync(file)
-    refuse('bundle output file already exists')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-  }
-
-  const root = canonicalStagingRoot(stagingRoot)
-  const target = canonicalPotential(file)
-  if (target === root || !target.startsWith(root + sep)) refuse(`bundle output escapes the staging root: ${file}`)
-  const relative = target.slice(root.length + sep.length)
-  if (relative.split(sep).some((part) => !SAFE_BUNDLE_PATH_SEGMENT.test(part))) {
-    refuse('bundle output path contains an unsafe segment')
-  }
-}
-
-function validateBundleRef(ref: string): void {
-  if (ref.length === 0 || ref.length > MAX_REF_LENGTH || CONTROL_CHARACTER.test(ref) || /\s/.test(ref)) {
-    refuse('bundle ref must be a bounded full ref name')
-  }
-  if (ref.includes('..') || ref.includes('@{')) refuse('bundle ref contains an unsafe sequence')
-  const parts = ref.split('/')
-  if (parts.length < 3 || parts[0] !== 'refs' || !['heads', 'tags'].includes(parts[1] ?? '')) {
-    refuse('bundle ref must name refs/heads/* or refs/tags/*')
-  }
-  if (
-    parts.some(
-      (part) =>
-        part.length === 0 ||
-        part === '.' ||
-        part === '..' ||
-        part.startsWith('.') ||
-        part.endsWith('.') ||
-        part.endsWith('.lock') ||
-        !SAFE_REF_COMPONENT.test(part)
-    )
-  ) {
-    refuse('bundle ref contains an unsafe segment')
-  }
-}
-
-function validateBundleCreate(subcommand: string, rest: string[], options: GitCommandPolicyOptions | undefined): void {
-  if (subcommand !== 'bundle') return
-  if (rest.length !== 3 && rest.length !== 4)
-    refuse('git bundle is admitted only as bundle create <file> [--filter=blob:none] <ref>')
-  if (rest[0] !== 'create') refuse('git bundle is admitted only for create')
-  const file = rest[1]
-  const maybeFilter = rest.length === 4 ? rest[2] : undefined
-  const ref = rest.at(-1)
-  if (!file || !ref) refuse('git bundle create requires a file and ref')
-  if (maybeFilter !== undefined && maybeFilter !== BUNDLE_FILTER)
-    refuse('git bundle create accepts only --filter=blob:none')
-  validateBundleFile(options?.stagingRoot, file)
-  validateBundleRef(ref)
-}
-
-export function validateGitArgs(args: string[], options?: GitCommandPolicyOptions): void {
+export function validateGitArgs(args: string[], context: GitPolicyContext = {}): void {
   const [subcommand, ...rest] = args
   if (!subcommand || !ALLOWED_GIT_SUBCOMMANDS.has(subcommand)) {
     throw new ExecRefusedError(`git ${subcommand ?? '(none)'} is not in the permitted inventory`)
   }
-  const perSubcommand = REFUSED_SUBCOMMAND_ARGUMENT[subcommand] ?? []
-  for (const argument of args) {
-    if (isRefusedArgument(argument)) {
+  const bundleUri = subcommand === 'clone' ? validateBundleUri(rest) : -1
+  rest.forEach((argument, index) => {
+    if (index === bundleUri) return
+    if (REFUSED_SHORT_CONFIG.test(argument) || refusedLongOption(argument)) {
       throw new ExecRefusedError(`argument ${argument} is refused`)
     }
-  }
+  })
+  const perSubcommand = REFUSED_SUBCOMMAND_ARGUMENT[subcommand] ?? []
   for (const argument of rest) {
     if (perSubcommand.some((pattern) => pattern.test(argument))) {
       throw new ExecRefusedError(`argument ${argument} is refused for git ${subcommand}`)
     }
+    if (subcommand === 'clone' && refusedCloneShortGroup(argument)) {
+      throw new ExecRefusedError(`argument ${argument} is refused for git clone`)
+    }
   }
-  validateBundleUris(args)
-  validateBundleCreate(subcommand, rest, options)
+  if (subcommand === 'bundle') validateBundleCreate(rest, context.bundleStagingDir)
+  if (subcommand === 'fsck' && (rest.length !== 1 || rest[0] !== '--connectivity-only')) {
+    throw new ExecRefusedError('git fsck is admitted only as fsck --connectivity-only')
+  }
 }

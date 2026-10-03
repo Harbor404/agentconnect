@@ -1,197 +1,213 @@
-import { afterAll, describe, expect, it } from 'vitest'
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { validateGitArgs } from '../src/workspace/git-command-policy.js'
+import { describe, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { ExecRefusedError, isValidBranchRef, validateGitArgs } from '../src/workspace/git-command-policy.js'
 
-const roots: string[] = []
+// Pure, I/O-free table of the shim's Git argv policy; real-Git execution lives in shim-exec-handler.test.ts.
 
-afterAll(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+const STAGING = '/run/agentconnect/bundle-staging'
+const context = { bundleStagingDir: STAGING }
+const refuses = (args: string[]): void => {
+  expect(() => validateGitArgs(args, context)).toThrow(ExecRefusedError)
+}
+const admits = (args: string[]): void => {
+  expect(() => validateGitArgs(args, context)).not.toThrow()
+}
+
+describe('refused long options include every abbreviation Git accepts', () => {
+  it.each([
+    [['clone', '--upload=x', 'u', 'd']],
+    [['clone', '--upl=x', 'u', 'd']],
+    [['clone', '--upl', 'x', 'u', 'd']],
+    [['clone', '--upload-p=x', 'u', 'd']],
+    [['clone', '--upload-pack', 'x', 'u', 'd']],
+    [['fetch', '--upload=x', 'origin']],
+    [['pull', '--upload=x', 'origin']],
+    [['ls-remote', '--upload=x', 'origin']],
+    [['ls-remote', '--exec=x', 'origin']],
+    [['ls-remote', '--exe=x', 'origin']],
+    [['push', '--receive=x', 'origin']],
+    [['push', '--receive-p=x', 'origin']],
+    [['push', '--receive', 'x', 'origin']],
+    [['push', '--exec=x', 'origin']],
+    [['status', '--conf=k']],
+    [['status', '--config-e=k']],
+    [['status', '--confi=k']],
+    [['clone', '--conf=protocol.ext.allow=always', 'ext::x', 'd']],
+    [['branch', '--exec-p=/tmp']],
+    [['branch', '--exec-pat=/tmp']],
+    [['branch', '--exec-path=/tmp']],
+    [['status', '--config-env=core.pager=EVIL']],
+    [['status', '-ccore.pager=EVIL']]
+  ])('refuses %j', (args) => refuses(args))
 })
 
-function fixture(): { root: string; stagingRoot: string } {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ac-git-policy-')))
-  roots.push(root)
-  const stagingRoot = join(root, 'staging')
-  mkdirSync(stagingRoot)
-  return { root, stagingRoot }
-}
+describe("clone's grouped short options", () => {
+  it.each([
+    [['clone', '-qu/evil', 'u', 'd']],
+    [['clone', '-lqu/evil', 'u', 'd']],
+    [['clone', '-qcprotocol.ext.allow=always', 'ext::x', 'd']],
+    [['clone', '-nc', 'k=v', 'u', 'd']]
+  ])('refuses %j', (args) => refuses(args))
 
-function allowed(args: string[], stagingRoot: string): void {
-  expect(() => validateGitArgs(args, { stagingRoot })).not.toThrow()
-}
+  it('never reads a value after -b as options', () => admits(['clone', '-bfeature-cu', 'u', 'd']))
+})
 
-function refused(args: string[], stagingRoot: string): void {
-  expect(() => validateGitArgs(args, { stagingRoot }), JSON.stringify(args)).toThrow()
-}
+describe('admitted near-misses the daemon sends', () => {
+  it.each([
+    [['status', '--porcelain=v2', '--branch', '-u', '-z']],
+    [['rev-list', '--count', 'HEAD']],
+    [['fetch', '-u', 'origin']],
+    [['clone', '--filter=blob:none', '--no-checkout', '--single-branch', '--branch', 'main', '--no-tags', 'u', 'repo']],
+    [['clone', '-b', 'main', '-o', 'origin', '-q', '-n', 'u', 'repo']],
+    [['push', '--no-verify', 'origin', 'refs/heads/a:refs/heads/a']],
+    [['commit', '--no-gpg-sign', '--cleanup=verbatim', '-m', 'x']],
+    [['checkout', '--no-track', '-B', 'b', 'refs/remotes/origin/b']],
+    [['config', '--replace-all', 'k', 'v']],
+    [['config', '--add', 'k', 'v']],
+    [['config', '--no-includes', '--get', 'k']],
+    [['diff', '--no-ext-diff', '--no-textconv', '--no-color']],
+    [['rev-parse', '--abbrev-ref', '--symbolic-full-name', '--show-prefix', '--git-common-dir']],
+    [['clone', '--no-bundle-uri', 'u', 'repo']]
+  ])('admits %j', (args) => admits(args))
+})
 
-describe('Git command policy', () => {
-  it('refuses long-option abbreviations that reach execution-sensitive Git options', () => {
-    const { stagingRoot } = fixture()
-    const remote = 'https://github.com/acme/repo.git'
-    for (const args of [
-      ['clone', '--upload-pack=sh -c "id"', remote, 'repo'],
-      ['clone', '--upload=sh -c "id"', remote, 'repo'],
-      ['clone', '--upl=sh -c "id"', remote, 'repo'],
-      ['fetch', '--upload=sh -c "id"', 'origin'],
-      ['push', '--receive-pack=sh -c "id"', 'origin'],
-      ['push', '--receive=sh -c "id"', 'origin'],
-      ['status', '--exec-path=/tmp/evil'],
-      ['status', '--exec=/tmp/evil'],
-      ['status', '--config=core.pager=evil'],
-      ['status', '--conf=core.pager=evil'],
-      ['status', '--config-env=core.pager=EVIL'],
-      ['status', '--config-e=core.pager=EVIL']
-    ]) {
-      refused(args, stagingRoot)
+describe('clone --bundle-uri', () => {
+  const longQuery = `X-Amz-Signature=${'a'.repeat(1500)}`
+  it('admits one joined https URL with a long presigned query', () =>
+    admits(['clone', `--bundle-uri=https://bucket.example.com/src/a.bundle?${longQuery}`, 'u', 'repo']))
+
+  it.each([
+    [['clone', '--bundle-uri', 'https://h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle=https://h/a.bundle', 'u', 'repo']],
+    [['clone', '--bun=https://h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-u=https://h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-ur=https://h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=http://h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=file:///etc/passwd', 'u', 'repo']],
+    [['clone', '--bundle-uri=s3://b/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=HTTPS://h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://user:pw@h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://@h/a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https:///p', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://h/a\n.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://h/a\r.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://h/a\t.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://h/a .bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://h/a\x7f.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=https://h\\a.bundle', 'u', 'repo']],
+    [['clone', '--bundle-uri=', 'u', 'repo']],
+    [['clone', `--bundle-uri=https://h/${'a'.repeat(8200)}`, 'u', 'repo']],
+    [['clone', '--bundle-uri=https://h/a.bundle', '--bundle-uri=https://h/b.bundle', 'u', 'repo']],
+    [['fetch', '--bundle-uri=https://h/a.bundle', 'origin']],
+    [['pull', '--bundle-uri=https://h/a.bundle', 'origin']],
+    [['ls-remote', '--bundle-uri=https://h/a.bundle', 'origin']],
+    [['push', '--bundle-uri=https://h/a.bundle', 'origin']]
+  ])('refuses %j', (args) => refuses(args))
+})
+
+const BAD_REFS = [
+  'HEAD',
+  'main',
+  'refs/remotes/origin/main',
+  'refs/tags/v1',
+  'refs/heads/',
+  'refs/heads/a..b',
+  'refs/heads/a@{1}',
+  'refs/heads/x.lock',
+  'refs/heads/.x',
+  'refs/heads/x/',
+  'refs/heads/x.',
+  'refs/heads/a//b',
+  'refs/heads/a\x01',
+  'refs/heads/a b',
+  'refs/heads/a~1',
+  'refs/heads/a^',
+  'refs/heads/a:b',
+  'refs/heads/a?',
+  'refs/heads/a*',
+  'refs/heads/a[',
+  'refs/heads/a\\b',
+  '^refs/heads/main',
+  'refs/heads/a..refs/heads/b'
+]
+const GOOD_REFS = ['refs/heads/main', 'refs/heads/feat/a-b', 'refs/heads/-x', 'refs/heads/a.b']
+
+describe.skipIf(process.platform === 'win32')('bundle create', () => {
+  const file = `${STAGING}/x.bundle`
+  it.each([
+    [['bundle', 'create', file, 'refs/heads/main']],
+    [['bundle', 'create', '-q', file, 'refs/heads/main']],
+    [['bundle', 'create', file, '--filter=blob:none', 'refs/heads/main']],
+    [['bundle', 'create', '-q', file, '--filter=blob:none', 'refs/heads/feat/a-b']]
+  ])('admits %j', (args) => admits(args))
+
+  it.each([
+    [['bundle', 'verify', file]],
+    [['bundle', 'unbundle', file]],
+    [['bundle', 'list-heads', file]],
+    [['bundle']],
+    [['bundle', 'create', '-', 'refs/heads/main']],
+    [['bundle', 'create', 'x.bundle', 'refs/heads/main']],
+    [['bundle', 'create', '/tmp/x.bundle', 'refs/heads/main']],
+    [['bundle', 'create', `${STAGING}/../x.bundle`, 'refs/heads/main']],
+    [['bundle', 'create', `${STAGING}/sub/x.bundle`, 'refs/heads/main']],
+    [['bundle', 'create', `${STAGING}//x.bundle`, 'refs/heads/main']],
+    [['bundle', 'create', `${STAGING}/x.pack`, 'refs/heads/main']],
+    [['bundle', 'create', `${STAGING}/.bundle`, 'refs/heads/main']],
+    [['bundle', 'create', `${STAGING}/-x.bundle`, 'refs/heads/main']],
+    [['bundle', 'create', file]],
+    [['bundle', 'create', file, 'refs/heads/a', 'refs/heads/b']],
+    ...BAD_REFS.map((ref) => [['bundle', 'create', file, ref]]),
+    [['bundle', 'create', file, '--all']],
+    [['bundle', 'create', file, '--filter=tree:0', 'refs/heads/main']],
+    [['bundle', 'create', file, '--filter=blob:limit=1k', 'refs/heads/main']],
+    [['bundle', 'create', '--quiet', file, 'refs/heads/main']],
+    [['bundle', 'create', '--progress', file, 'refs/heads/main']],
+    [['bundle', 'create', '--version=3', file, 'refs/heads/main']],
+    [['bundle', 'create', file, '--stdin']],
+    [['bundle', 'create', file, '-q', 'refs/heads/main']],
+    [['bundle', 'create', file, 'refs/heads/main', '--filter=blob:none']]
+  ])('refuses %j', (args) => refuses(args as string[]))
+
+  it('is refused without a configured staging directory', () => {
+    expect(() => validateGitArgs(['bundle', 'create', file, 'refs/heads/main'])).toThrow(ExecRefusedError)
+  })
+})
+
+describe('isValidBranchRef', () => {
+  it.each(BAD_REFS)('refuses %j', (ref) => expect(isValidBranchRef(ref)).toBe(false))
+  it.each(GOOD_REFS)('admits %j', (ref) => expect(isValidBranchRef(ref)).toBe(true))
+
+  it('agrees with git check-ref-format on every refs/heads/ row', () => {
+    for (const ref of [...BAD_REFS, ...GOOD_REFS]) {
+      let gitAccepts = true
+      try {
+        execFileSync('git', ['check-ref-format', ref], { stdio: 'ignore' })
+      } catch {
+        gitAccepts = false
+      }
+      // Outside refs/heads/ the namespace alone refuses, so only branch rows must agree exactly.
+      if (ref.startsWith('refs/heads/')) expect(gitAccepts, ref).toBe(isValidBranchRef(ref))
     }
   })
+})
 
-  it('continues to accept ordinary long options in admitted Git flows', () => {
-    const { stagingRoot } = fixture()
-    const remote = 'https://github.com/acme/repo.git'
-    for (const args of [
-      ['clone', '--filter=blob:none', '--no-checkout', '--single-branch', remote, 'repo'],
-      ['status', '--short', '--branch'],
-      ['log', '--oneline', '--decorate'],
-      ['config', '--get', 'user.name'],
-      ['remote', '--verbose']
-    ]) {
-      allowed(args, stagingRoot)
-    }
-  })
+describe('fsck', () => {
+  it('admits exactly --connectivity-only', () => admits(['fsck', '--connectivity-only']))
+  it.each([
+    [['fsck']],
+    [['fsck', '--full']],
+    [['fsck', '--connectivity-only', '--lost-found']],
+    [['fsck', '--connectivity-only=true']],
+    [['fsck', '--connectivity-only', 'extra']],
+    [['fsck', '--strict']]
+  ])('refuses %j', (args) => refuses(args))
+})
 
-  it('accepts both Git spellings of an HTTPS bundle URI', () => {
-    const { stagingRoot } = fixture()
-    for (const args of [
-      [
-        'clone',
-        '--bundle-uri=https://cache.example.test/repo.bundle?X-Amz-Signature=a%2Fb',
-        'https://github.com/acme/repo.git',
-        'repo'
-      ],
-      [
-        'clone',
-        '--bundle-uri',
-        'https://cache.example.test/repo.bundle?X-Amz-Signature=a%2Fb',
-        'https://github.com/acme/repo.git',
-        'repo'
-      ]
-    ]) {
-      allowed(args, stagingRoot)
-    }
-  })
-
-  it('refuses every non-HTTPS or ambiguous bundle URI spelling', () => {
-    const { stagingRoot } = fixture()
-    const remote = 'https://github.com/acme/repo.git'
-    const refusedArgs = [
-      ['clone', '--bundle-uri=http://cache.example.test/repo.bundle', remote, 'repo'],
-      ['clone', '--bundle-uri=ssh://git@example.test/repo.bundle', remote, 'repo'],
-      ['clone', '--bundle-uri=file:///etc/passwd', remote, 'repo'],
-      ['clone', '--bundle-uri=/tmp/repo.bundle', remote, 'repo'],
-      ['clone', '--bundle-uri=https:/cache.example.test/repo.bundle', remote, 'repo'],
-      ['clone', '--bundle-uri=https://', remote, 'repo'],
-      ['clone', '--bundle-uri=HTTPS://cache.example.test/repo.bundle', remote, 'repo'],
-      ['clone', '--bundle-uri=https://user:pass@cache.example.test/repo.bundle', remote, 'repo'],
-      ['clone', '--bundle-uri=https://cache.example.test/repo.bundle\n--upload-pack=evil', remote, 'repo'],
-      ['clone', '--bundle-uri', 'file:///tmp/repo.bundle', remote, 'repo'],
-      ['clone', '--bundle-uri', '--filter=blob:none', remote, 'repo'],
-      ['clone', '--bundle-uri', 'ssh://git@example.test/repo', remote, 'repo'],
-      ['clone', '--bundle-urihttps://cache.example.test/repo.bundle', remote, 'repo'],
-      ['clone', '--bu=file:///etc/passwd', remote, 'repo'],
-      ['clone', '--bundle-u', 'file:///etc/passwd', remote, 'repo'],
-      [
-        'clone',
-        '--bundle-uri=https://cache.example.test/one.bundle',
-        '--bundle-uri=https://cache.example.test/two.bundle',
-        remote,
-        'repo'
-      ],
-      ['fetch', '--bundle-uri=https://cache.example.test/repo.bundle', 'origin']
-    ]
-    for (const args of refusedArgs) refused(args, stagingRoot)
-  })
-
-  it('accepts only the bundle create grammar and the exact blobless filter spelling', () => {
-    const { stagingRoot } = fixture()
-    mkdirSync(join(stagingRoot, 'nested'))
-    allowed(['bundle', 'create', join(stagingRoot, 'full.bundle'), 'refs/heads/main'], stagingRoot)
-    allowed(
-      ['bundle', 'create', join(stagingRoot, 'nested', 'blobless.bundle'), '--filter=blob:none', 'refs/tags/v1.2.3'],
-      stagingRoot
-    )
-  })
-
-  it('refuses every other bundle verb and extra bundle-create spelling', () => {
-    const { stagingRoot } = fixture()
-    const file = join(stagingRoot, 'repo.bundle')
-    const refusedArgs = [
-      ['bundle'],
-      ['bundle', 'verify', file],
-      ['bundle', 'list-heads', file],
-      ['bundle', 'unbundle', file],
-      ['unbundle', file],
-      ['verify', file],
-      ['list-heads', file],
-      ['bundle', 'create', file, '--all'],
-      ['bundle', 'create', file, 'refs/heads/main', '--filter=blob:none'],
-      ['bundle', 'create', '--filter=blob:none', file, 'refs/heads/main'],
-      ['bundle', 'create', file, '--filter', 'blob:none', 'refs/heads/main'],
-      ['bundle', 'create', file, '--filter=blob:limit=10', 'refs/heads/main'],
-      ['bundle', 'create', file, '--filter=blob:none', '--all'],
-      ['bundle', 'create', file, '--filter=blob:none', 'refs/heads/main', 'extra'],
-      ['bundle', 'create', file, '--quiet', 'refs/heads/main'],
-      ['bundle', 'create', file, 'refs/heads/main', '--version=3']
-    ]
-    for (const args of refusedArgs) refused(args, stagingRoot)
-  })
-
-  it('refuses bundle output paths outside the staging root, including symlink escapes', () => {
-    const { root, stagingRoot } = fixture()
-    const outside = join(root, 'outside')
-    mkdirSync(outside)
-    const outsideFile = join(outside, 'escape.bundle')
-    writeFileSync(outsideFile, 'outside')
-
-    for (const file of [
-      outsideFile,
-      join(stagingRoot, '..', 'escape.bundle'),
-      'relative.bundle',
-      join(stagingRoot, 'not-a-bundle.txt')
-    ]) {
-      refused(['bundle', 'create', file, 'refs/heads/main'], stagingRoot)
-    }
-
-    symlinkSync(outside, join(stagingRoot, 'linked-outside'))
-    refused(['bundle', 'create', join(stagingRoot, 'linked-outside', 'escape.bundle'), 'refs/heads/main'], stagingRoot)
-    symlinkSync(outsideFile, join(stagingRoot, 'linked-file.bundle'))
-    refused(['bundle', 'create', join(stagingRoot, 'linked-file.bundle'), 'refs/heads/main'], stagingRoot)
-
-    renameSync(stagingRoot, join(root, 'staging-real'))
-    symlinkSync(outside, stagingRoot)
-    refused(['bundle', 'create', join(stagingRoot, 'root-replacement.bundle'), 'refs/heads/main'], stagingRoot)
-  })
-
-  it('refuses refs that read as options, revisions, or injected commands', () => {
-    const { stagingRoot } = fixture()
-    const file = join(stagingRoot, 'repo.bundle')
-    for (const ref of [
-      '--all',
-      'HEAD',
-      'main',
-      'refs/heads/main;touch /tmp/pwned',
-      'refs/heads/main$(touch /tmp/pwned)',
-      'refs/heads/`touch /tmp/pwned`',
-      'refs/heads/main\n--all',
-      'refs/heads/main..next',
-      'refs/heads/main.lock',
-      'refs/heads/.hidden',
-      'refs/heads/',
-      'refs/remotes/origin/main'
-    ]) {
-      refused(['bundle', 'create', file, ref], stagingRoot)
-    }
-  })
+describe('refs/bundles cleanup shape', () => {
+  it.each([
+    [['show-ref']],
+    [['update-ref', '-d', 'refs/bundles/main']],
+    [['update-ref', '-d', 'refs/bundles/heads/main']]
+  ])('admits %j', (args) => admits(args))
 })

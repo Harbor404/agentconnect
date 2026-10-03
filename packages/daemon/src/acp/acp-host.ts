@@ -164,7 +164,7 @@ export type { AcpSandboxLaunch, SpawnDriver, SpawnedRuntime } from './spawn-driv
 export type { SteeringIdleBehavior, SteeringOutcome } from './steering.js'
 
 /** The `session/set_config_option` call that applies a desired value, or the reason none is needed. */
-export type ConfigSelectionPlan = { configId: string; value: string } | { skip: string }
+export type ConfigSelectionPlan = { configId: string; value: string } | { current: true } | { skip: string }
 
 /**
  * Distill the human-actionable reason from a failed ACP request. Adapters wrap
@@ -376,11 +376,7 @@ export function turnFailureCode(err: unknown): TurnFailureCode {
     : 'turn_failed'
 }
 
-/**
- * Resolve how to apply `desired` to the select config option tagged `category`.
- * `{skip}` (with the reason) means nothing should be sent: the runtime
- * advertises no such selector, doesn't offer the value, or already has it set.
- */
+/** Resolve `desired` for the `category` select: send it, it is already `current`, or `skip` (not offered). */
 export function planConfigSelection(
   configOptions: SessionConfigOption[] | null | undefined,
   category: string,
@@ -392,7 +388,7 @@ export function planConfigSelection(
   if (!values.includes(desired)) {
     return { skip: `value "${desired}" not offered (available: ${values.join(', ')})` }
   }
-  if (opt.currentValue === desired) return { skip: `already "${desired}"` }
+  if (opt.currentValue === desired) return { current: true }
   return { configId: opt.id, value: desired }
 }
 
@@ -449,6 +445,8 @@ export interface AcpToolSandbox {
   claudeProtectedSettings?: ClaudeProtectedSettings
   /** Writable mount targets reopened in the runtime-native tool sandbox. */
   sharedWriteRoots?: string[]
+  /** The runtime's private state (a session HOME's `.claude`): model-authored tools may read it, never change it. */
+  readOnlyStateRoots?: string[]
 }
 
 interface ClaudeSessionSettings {
@@ -470,7 +468,8 @@ export function claudeSessionMeta(
   protectedSettings?: ClaudeProtectedSettings,
   allowModelToolUnixSockets = false,
   extraDisallowedTools: readonly string[] = [],
-  sharedWriteRoots: readonly string[] = []
+  sharedWriteRoots: readonly string[] = [],
+  readOnlyStateRoots: readonly string[] = []
 ):
   | {
       claudeCode: {
@@ -489,11 +488,15 @@ export function claudeSessionMeta(
   // Append the system prompt and memory together, omitting an empty result.
   const append = [systemPrompt, memoryAppend].filter(Boolean).join('\n\n')
   const ultracode = reasoningEffort === ULTRACODE_EFFORT
-  const deny = [...new Set(protectedCredentialRoots)].flatMap((root) => {
-    // Claude uses gitignore patterns with // for absolute paths; cover the root and its descendants.
-    const pattern = `/${root.replace(/\/+$/, '').replace(/[\\*?[\] ]/g, (char) => `\\${char}`)}`
-    return ['Read', 'Edit'].flatMap((tool) => [`${tool}(${pattern})`, `${tool}(${pattern}/**)`])
-  })
+  // Claude uses gitignore patterns with // for absolute paths; cover the root and its descendants.
+  const rules = (roots: readonly string[] | undefined, tools: readonly string[]): string[] =>
+    [...new Set(roots)].flatMap((root) => {
+      const pattern = `/${root.replace(/\/+$/, '').replace(/[\\*?[\] ]/g, (char) => `\\${char}`)}`
+      return tools.flatMap((tool) => [`${tool}(${pattern})`, `${tool}(${pattern}/**)`])
+    })
+  // Credentials are neither read nor changed; the runtime's own state is read back (its saved tool results, its
+  // synced skills) but never changed, so the model cannot plant settings or hooks the trusted parent would load.
+  const deny = [...rules(protectedCredentialRoots, ['Read', 'Edit']), ...rules(readOnlyStateRoots, ['Edit'])]
   const settings: ClaudeSessionSettings = {
     ...(protectedSettings ?? {}),
     // Claude requires custom plans inside the workspace; its default HOME/.claude/plans is protected above.
@@ -508,7 +511,12 @@ export function claudeSessionMeta(
         disallowedTools: [...CLAUDE_DISALLOWED_BUILTIN_TOOLS, ...extraDisallowedTools],
         ...(protectedCredentialRoots
           ? {
-              sandbox: claudeInnerSandboxSettings(protectedCredentialRoots, allowModelToolUnixSockets, sharedWriteRoots)
+              sandbox: claudeInnerSandboxSettings(
+                protectedCredentialRoots,
+                allowModelToolUnixSockets,
+                sharedWriteRoots,
+                readOnlyStateRoots
+              )
             }
           : {}),
         ...(protectedSettings || ultracode || deny.length > 0 ? { settings } : {})
@@ -984,7 +992,8 @@ export class AcpHost {
       this.opts.toolSandbox?.claudeProtectedSettings,
       this.opts.toolSandbox?.allowModelToolUnixSockets,
       extraDisallowedTools,
-      this.opts.toolSandbox?.sharedWriteRoots
+      this.opts.toolSandbox?.sharedWriteRoots,
+      this.opts.toolSandbox?.readOnlyStateRoots
     )
     const activeAdditionalDirectories = this.canUseAdditionalDirectories ? additionalDirectories : []
     const res = await this.conn!.agent.request(methods.agent.session.new, {
@@ -1084,6 +1093,8 @@ export class AcpHost {
     value: string
   ): Promise<SessionConfigOption[] | undefined> {
     const plan = planConfigSelection(options, category, value)
+    // Already in effect is success: read-only gates re-assert a mode the session may already hold (#2774).
+    if ('current' in plan) return options ?? undefined
     if ('skip' in plan) {
       const models = category === 'model' ? modelOptionsFrom(options) : null
       if (models && models.current !== value) throw new ModelSelectionError(value, new Error(plan.skip))
@@ -1107,7 +1118,7 @@ export class AcpHost {
     }
   }
 
-  /** Apply a live selection and refresh caches; false means no request was needed or supported. */
+  /** Apply a live selection and refresh caches; true once the value is in effect, false when it is not offered. */
   private async setSessionConfig(sessionId: string, category: string, value: string): Promise<boolean> {
     if (!this.live.has(sessionId)) return false
     const options = await this.selectSessionConfig(sessionId, this.sessionConfigs.get(sessionId), category, value)
@@ -1242,7 +1253,8 @@ export class AcpHost {
         this.opts.toolSandbox?.claudeProtectedSettings,
         this.opts.toolSandbox?.allowModelToolUnixSockets,
         [],
-        this.opts.toolSandbox?.sharedWriteRoots
+        this.opts.toolSandbox?.sharedWriteRoots,
+        this.opts.toolSandbox?.readOnlyStateRoots
       )
       const activeAdditionalDirectories = this.canUseAdditionalDirectories ? additionalDirectories : []
       const res = await this.conn!.agent.request(methods.agent.session.load, {
